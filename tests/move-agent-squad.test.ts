@@ -467,7 +467,8 @@ describe('move_agent_squad', () => {
     if (result.ok) return
     expect(result.status).toBe(403)
     expect(result.error).toBe('forbidden')
-    expect(result.detail).toEqual({ need: 'admin' })
+    // W1-2: the floor refusal now names the one-tap door (owner sudo); it grants nothing.
+    expect(result.detail).toEqual({ need: 'admin', hint: expect.stringContaining('action:sudo_move_agent_squad') })
   })
 
   it('Athena HARD-BLOCK 2: tenant wall — token tenant must match this pot, not the request', async () => {

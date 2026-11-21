@@ -141,7 +141,9 @@ no admin of its own. Its one way up is `request_elevation`, per action, never bl
 
 - **What it may ask for.** Only the actions in `ATTACHED_SUDO_ACTIONS` (`src/auth/attached-ceiling.ts`): `action:org_structure`
   (rename a work department or update a squad) and `action:sudo_seat_event_grant` (one exact request for its own agent’s
-  wake hints, delivered to a different eligible host). Everything else is refused with
+  wake hints, delivered to a different eligible host), plus the three W1-2 hygiene acts `action:sudo_archive_row`,
+  `action:sudo_move_agent_squad` and `action:sudo_project_repo` (one exact call each, run as the attaching human; same fences
+  as for a bound agent, see approval-bot.md). Everything else is refused with
   `attached_seat_cannot_elevate` (`mint_token`, `manage_access`, `register_key`, `deploy`, `migrate`, `secrets`,
   `org_department_create`, `routine_archive`, `home_access`, every gate power). The list is one exported const, enforced at three
   points (the request, the decision, every use in `hasElevatedAction`). Seat-event sudo checks the exact agent and host

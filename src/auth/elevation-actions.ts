@@ -255,6 +255,31 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
     effect: 'reversible',
     effectNote: 'The seat-event grant can be revoked (DELETE /api/fleet/events/grants/:agent) after the call.',
   },
+  // W1-2 (council-20261121-authz, Kasra + Loom answers): the three hygiene acts that refused every agent even with a standing go.
+  'action:sudo_archive_row': {
+    key: 'action:sudo_archive_row',
+    enforced: true,
+    label: 'Archive one task, squad or inactive agent, as you (one call)',
+    description: 'ONE archive_row call, run as you: archive one task, one work squad or one INACTIVE agent. Never a member, a project, a home squad or the requesting agent. Single-use.',
+    effect: 'reversible',
+    effectNote: 'unarchive_row restores the row (a task returns to its prior status).',
+  },
+  'action:sudo_move_agent_squad': {
+    key: 'action:sudo_move_agent_squad',
+    enforced: true,
+    label: 'Move an agent to a squad it already belongs to, as you (one call)',
+    description: 'ONE move_agent_squad call, run as you: make a work squad the agent is ALREADY a member of its home squad, at observer or member and never above its standing there. Never the requesting agent. Single-use.',
+    effect: 'reversible',
+    effectNote: 'Another move_agent_squad moves the agent back.',
+  },
+  'action:sudo_project_repo': {
+    key: 'action:sudo_project_repo',
+    enforced: true,
+    label: 'Add or remove one repository on a project, as you (one call)',
+    description: 'ONE project_update call that adds or removes one repository on the project\'s allow-list (add_repo / remove_repo) and changes nothing else, run as you. Single-use. Org scope only.',
+    effect: 'reversible',
+    effectNote: 'The opposite edit (remove_repo / add_repo) undoes it.',
+  },
   // Installer window (PR-C, design S1). Consumed by src/operators/installer-window.ts, which turns a LIVE grant of one of
   // these into an in-memory delegation row for the structural-write chokepoint. Tier table: src/operators/installer-tiers.ts.
   // Credentials (token/key mint) are never part of either tier; request them separately as action:mint_token.
@@ -328,6 +353,9 @@ export const SENSITIVE_STEP_UP_ACTIONS: ReadonlySet<string> = new Set([
   'action:sudo_squad_dyad_pin',
   'action:sudo_grant_gate_capability',
   'action:sudo_seat_event_grant',
+  'action:sudo_archive_row',
+  'action:sudo_move_agent_squad',
+  'action:sudo_project_repo',
 ])
 
 /** Owner-sudo actions: each names exactly one owner-only tool (src/auth/owner-sudo.ts). */
@@ -336,6 +364,9 @@ export const OWNER_SUDO_ACTIONS: readonly string[] = Object.freeze([
   'action:sudo_squad_dyad_pin',
   'action:sudo_grant_gate_capability',
   'action:sudo_seat_event_grant',
+  'action:sudo_archive_row',
+  'action:sudo_move_agent_squad',
+  'action:sudo_project_repo',
 ])
 
 export function isOwnerSudoAction(key: string): boolean {
@@ -350,4 +381,4 @@ export const OWNER_SUDO_MAX_MINUTES = 60
  * step-up (SENSITIVE_STEP_UP_ACTIONS, e.g. the broad action:manage_access) stays passkey / Mini App / Access only: a bot tap
  * is refused for it. An allow-list, never a global "a bot tap is a fresh reauth". Only args-bound single-use actions belong here.
  */
-export const BOT_STEP_UP_ACTIONS: readonly string[] = OWNER_SUDO_ACTIONS // all four sudo actions are args-bound (the digest is mandatory), single-use
+export const BOT_STEP_UP_ACTIONS: readonly string[] = OWNER_SUDO_ACTIONS // every sudo action are args-bound (the digest is mandatory), single-use

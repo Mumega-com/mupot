@@ -100,7 +100,10 @@ export function verdictAttribution(auth: Pick<AuthContext, 'seatBinding'>): Verd
  * the decision, every use in hasElevatedAction), so a row forged past one of them is still refused by the others.
  */
 export const ATTACHED_SEAT_EVENT_SUDO_ACTION = 'action:sudo_seat_event_grant'
-export const ATTACHED_SUDO_ACTIONS: readonly string[] = ['action:org_structure', ATTACHED_SEAT_EVENT_SUDO_ACTION]
+/** W1-2 (council-20261121-authz): the three hygiene acts an attached chat may ask its human for, one exact call each, run as that
+ *  human (owner-sudo.ts). Each is reversible (unarchive_row, move back, remove the repo) and confers nothing. */
+export const ATTACHED_HYGIENE_SUDO_ACTIONS: readonly string[] = Object.freeze(['action:sudo_archive_row', 'action:sudo_move_agent_squad', 'action:sudo_project_repo'])
+export const ATTACHED_SUDO_ACTIONS: readonly string[] = ['action:org_structure', ATTACHED_SEAT_EVENT_SUDO_ACTION, ...ATTACHED_HYGIENE_SUDO_ACTIONS]
 
 export function isAttachedSudoAction(action: string): boolean {
   return ATTACHED_SUDO_ACTIONS.includes(action)

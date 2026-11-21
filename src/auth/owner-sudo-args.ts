@@ -1,7 +1,7 @@
 // mupot — owner sudo: the feature flag and the EXACT-ARGUMENTS binding (SENSITIVE).
 //
 // The human approves one concrete call, not a blank check inside an action and scope. Every sudo request carries the call's
-// arguments (`sudo_args`, mandatory for all four actions); they are resolved to ids, fenced, canonicalised and stored with their
+// arguments (`sudo_args`, mandatory for every sudo action); they are resolved to ids, fenced, canonicalised and stored with their
 // sha256 on the request. The approval message shows them resolved to NAMES. At use time the call's own arguments go through the
 // SAME canonicaliser and must hash to the stored digest, or the call is refused and spends nothing.
 //
@@ -9,12 +9,18 @@
 //   - a gate grant never confers gate:hadi, a reserved lane (src/gates/lanes.ts), any gate a HUMAN member already holds, or
 //     anything to the requesting agent or its own member;
 //   - the dyad pin cannot include the requesting agent; the seat-event host cannot be the requesting agent;
-//   - squad_member_add confers observer/member only and never to the requesting agent.
+//   - squad_member_add confers observer/member only and never to the requesting agent;
+//   - archive_row covers tasks, work squads and INACTIVE agents only (never members, projects, a home squad or the requester);
+//   - move_agent_squad moves another agent only into a work squad it ALREADY belongs to, at observer/member, never above the
+//     standing it already holds there;
+//   - project_update covers exactly ONE repository allow-list edit (add_repo or remove_repo) and nothing else.
 import type { Env } from '../types'
 import { GATE_CAPABILITY_RE } from '../gates/grants'
 import * as lanes from '../gates/lanes'
 import { untrustedLine, untrustedName } from './untrusted-line'
 import { resolveAgentRef, resolveSquadRef } from '../org/resolve'
+import { CAPABILITY_LIVE_PREDICATE, capabilityRank, nowCapabilitySql } from './capability'
+import { repoKeyFromUrl } from '../workspaces/repo-key'
 
 /** OWNER_SUDO_ENABLED = '1' | 'true'. Default OFF: with it off no sudo action can be requested and resolveOwnerSudo is a no-op. */
 export function ownerSudoEnabled(env: Pick<Env, 'OWNER_SUDO_ENABLED'>): boolean {
@@ -27,6 +33,12 @@ export type SudoActionKey =
   | 'action:sudo_squad_dyad_pin'
   | 'action:sudo_grant_gate_capability'
   | 'action:sudo_seat_event_grant'
+  | 'action:sudo_archive_row'
+  | 'action:sudo_move_agent_squad'
+  | 'action:sudo_project_repo'
+
+/** The tables a sudo archive_row may touch. Members (a human) and projects stay operator-only. */
+export const SUDO_ARCHIVE_TABLES: readonly string[] = Object.freeze(['tasks', 'squads', 'agents'])
 
 /** Named lane constants (src/gates/lanes.ts): a sudo call never confers these either (a stricter set than the shared reserved rule). */
 const NAMED_LANES: ReadonlySet<string> = new Set<string>([
@@ -76,12 +88,18 @@ const REQUIRED_KEYS: Readonly<Record<SudoActionKey, readonly string[]>> = {
   'action:sudo_squad_dyad_pin': ['squad', 'agent_a', 'agent_b'],
   'action:sudo_grant_gate_capability': ['capability', 'principal_type', 'principal_id'],
   'action:sudo_seat_event_grant': ['host_agent_id', 'agent_id'],
+  'action:sudo_archive_row': ['table', 'id'],
+  'action:sudo_move_agent_squad': ['agent', 'to_squad', 'capability'],
+  'action:sudo_project_repo': ['project_id', 'op', 'repo'],
 }
 const OPTIONAL_KEYS: Readonly<Record<SudoActionKey, readonly string[]>> = {
   'action:sudo_squad_member_add': [],
   'action:sudo_squad_dyad_pin': [],
   'action:sudo_grant_gate_capability': [],
   'action:sudo_seat_event_grant': ['project_id'],
+  'action:sudo_archive_row': [],
+  'action:sudo_move_agent_squad': [],
+  'action:sudo_project_repo': [],
 }
 
 /** Resolve, fence and canonicalise one sudo call's arguments. `raw` is `sudo_args` at request time and the mapped tool args at use time. */
@@ -146,6 +164,70 @@ export async function canonicalizeSudoArgs(env: Env, action: SudoActionKey, raw:
     return finish({ capability: cap, principal_type: pt, principal_id: pid }, null)
   }
 
+  if (action === 'action:sudo_archive_row') {
+    const table = text(raw.table), id = typeof raw.id === 'string' ? raw.id : null
+    if (!table || !id || id.trim().length === 0) return bad('sudo_args_required', 'table and id are required')
+    if (id !== id.trim()) return bad('sudo_args_invalid', 'id must be the exact row id')
+    if (!SUDO_ARCHIVE_TABLES.includes(table)) return bad('sudo_archive_table_not_covered', 'an owner-sudo archive_row covers tasks, squads and inactive agents only')
+    if (table === 'tasks') {
+      const t = await env.DB.prepare('SELECT squad_id FROM tasks WHERE id = ?1 LIMIT 1').bind(id).first<{ squad_id: string | null }>()
+      if (!t) return bad('task_not_found', 'unknown task')
+      return finish({ table, id }, t.squad_id ?? null)
+    }
+    if (table === 'squads') {
+      const q = await env.DB.prepare('SELECT id, kind FROM squads WHERE id = ?1 LIMIT 1').bind(id).first<{ id: string; kind: string }>()
+      if (!q) return bad('squad_not_found', 'unknown squad')
+      if (q.kind !== 'work') return bad('home_squad_immutable', 'not a work squad')
+      return finish({ table, id }, q.id)
+    }
+    const a = await env.DB.prepare('SELECT squad_id, status FROM agents WHERE id = ?1 LIMIT 1').bind(id).first<{ squad_id: string; status: string }>()
+    if (!a) return bad('agent_not_found', 'unknown agent')
+    if (who.agentId && id === who.agentId) return bad('cannot_archive_self', 'a sudo call may not archive the requesting agent')
+    if (a.status !== 'inactive') return bad('sudo_agent_not_inactive', 'an owner-sudo archive_row archives an INACTIVE agent only (deactivate_agent first)')
+    return finish({ table, id }, a.squad_id)
+  }
+
+  if (action === 'action:sudo_move_agent_squad') {
+    const aRef = text(raw.agent), sRef = text(raw.to_squad), cap = text(raw.capability)
+    if (!aRef || !sRef || !cap) return bad('sudo_args_required', 'agent, to_squad and capability are required')
+    if (cap !== 'observer' && cap !== 'member') return bad('sudo_capability_ceiling', 'an owner-sudo move_agent_squad may set observer or member only')
+    const ag = await resolveAgentRef(env, aRef)
+    const sq = await resolveSquadRef(env, sRef)
+    if (!ag.ok || !sq.ok) return bad(!sq.ok ? 'squad_not_found' : 'agent_not_found', 'unknown squad or agent')
+    if (sq.value.kind !== 'work') return bad('home_squad_immutable', 'not a work squad')
+    if (who.agentId && ag.value.id === who.agentId) return bad('cannot_grant_to_self', 'a sudo call may not move the requesting agent')
+    // ALREADY A MEMBER: the move only makes a squad the agent already belongs to its home. Both planes count (a live
+    // membership row, or a live capability row of the agent's welded member), and the move never sets a standing above the
+    // one already held there, so nothing widens.
+    type HeldRow = { capability: Parameters<typeof capabilityRank>[0] }
+    const [memberships, caps] = await Promise.all([
+      env.DB.prepare(`SELECT m.capability AS capability FROM memberships m WHERE m.agent_id = ?1 AND m.squad_id = ?2 AND ${CAPABILITY_LIVE_PREDICATE('m', '?3')}`)
+        .bind(ag.value.id, sq.value.id, nowCapabilitySql()).all<HeldRow>(),
+      env.DB.prepare(
+        `SELECT c.capability AS capability FROM capabilities c
+           JOIN agent_member_bindings b ON b.member_id = c.member_id AND b.tenant = ?4
+          WHERE b.agent_id = ?1 AND c.scope_type = 'squad' AND c.scope_id = ?2 AND ${CAPABILITY_LIVE_PREDICATE('c', '?3')}`,
+      ).bind(ag.value.id, sq.value.id, nowCapabilitySql(), env.TENANT_SLUG).all<HeldRow>(),
+    ])
+    const held = Math.max(-1, ...[...(memberships.results ?? []), ...(caps.results ?? [])].map((r) => capabilityRank(r.capability)))
+    if (held < 0) return bad('sudo_move_not_member', 'an owner-sudo move_agent_squad moves an agent only into a squad it is already a member of (squad_member_add first)')
+    if (capabilityRank(cap) > held) return bad('sudo_capability_ceiling', 'an owner-sudo move never sets a standing above the one the agent already holds on that squad')
+    return finish({ agent_id: ag.value.id, to_squad_id: sq.value.id, capability: cap }, sq.value.id)
+  }
+
+  if (action === 'action:sudo_project_repo') {
+    const projectId = text(raw.project_id), op = text(raw.op), repo = text(raw.repo)
+    if (!projectId || !op || !repo) return bad('sudo_args_required', 'project_id, op and repo are required')
+    if (op !== 'add' && op !== 'remove') return bad('sudo_args_invalid', 'op is add or remove')
+    if (projectId !== raw.project_id) return bad('sudo_args_invalid', 'project_id must be the exact project id')
+    const proj = await env.DB.prepare('SELECT 1 AS x FROM projects WHERE id = ?1 LIMIT 1').bind(projectId).first<{ x: number }>()
+    if (!proj) return bad('project_not_found', 'project_id must be the id of a real project')
+    // The SAME fold setProjectRepo writes with: any spelling of one repository is one approved call, a different repository is not.
+    const repoKey = repoKeyFromUrl(repo)
+    if (!repoKey) return bad('sudo_args_invalid', 'repo must be a git remote URL')
+    return finish({ project_id: projectId, op, repo_key: repoKey }, null)
+  }
+
   // action:sudo_seat_event_grant
   const hostId = text(raw.host_agent_id), agentId = text(raw.agent_id)
   if (!hostId || !agentId) return bad('sudo_args_required', 'host_agent_id and agent_id are required')
@@ -165,7 +247,23 @@ export async function canonicalizeSudoArgs(env: Env, action: SudoActionKey, raw:
 }
 
 /** The tool call's arguments in the `sudo_args` shape of its action, or null when the call is not the act the action names. */
-export function sudoRawFromToolArgs(tool: 'squad_member_add' | 'update_squad' | 'grant_gate_capability' | 'seat_event_grant', args: Record<string, unknown>): Record<string, unknown> | null {
+export function sudoRawFromToolArgs(tool: 'squad_member_add' | 'update_squad' | 'grant_gate_capability' | 'seat_event_grant' | 'archive_row' | 'move_agent_squad' | 'project_update', args: Record<string, unknown>): Record<string, unknown> | null {
+  if (tool === 'archive_row') {
+    // reason is the receipt's free text and expected_status only narrows (a drifted row is refused): neither is authority.
+    const extra = Object.keys(args).filter((k) => !['table', 'id', 'reason', 'expected_status'].includes(k))
+    return extra.length > 0 ? null : { table: args.table, id: args.id }
+  }
+  if (tool === 'move_agent_squad') {
+    const extra = Object.keys(args).filter((k) => !['agent', 'to_squad', 'capability', 'reason'].includes(k))
+    return extra.length > 0 ? null : { agent: args.agent, to_squad: args.to_squad, capability: args.capability }
+  }
+  if (tool === 'project_update') {
+    // ONE repository edit and nothing else: any other field (status, name...) or both edits at once is a different call.
+    const extra = Object.keys(args).filter((k) => !['project_id', 'add_repo', 'remove_repo'].includes(k))
+    const add = 'add_repo' in args, remove = 'remove_repo' in args
+    if (extra.length > 0 || add === remove) return null
+    return { project_id: args.project_id, op: add ? 'add' : 'remove', repo: add ? args.add_repo : args.remove_repo }
+  }
   if (tool === 'squad_member_add') return { squad: args.squad, agent: args.agent, capability: args.capability }
   if (tool === 'update_squad') {
     // A dyad pin is ONLY a pin: any other key (slug, budget...) makes it a different call.
@@ -227,6 +325,17 @@ export async function describeSudoArgs(env: Env, action: string, json: string): 
       who = labelled('member', row?.display_name, o.principal_id)
     }
     return `grant ${await laneOf(o.capability)} to ${who}`
+  }
+  if (action === 'action:sudo_archive_row') {
+    const id = o.id
+    const what = o.table === 'agents' ? await agent(id) : o.table === 'squads' ? await squad(id) : `task ${untrustedLine(typeof id === 'string' ? id : String(id), 80)}`
+    return `archive ${what} (undo with unarchive_row)`
+  }
+  if (action === 'action:sudo_move_agent_squad') return `move ${await agent(o.agent_id)} to ${await squad(o.to_squad_id)} (already a member there) as ${cap(o.capability)}`
+  if (action === 'action:sudo_project_repo') {
+    const repo = untrustedLine(typeof o.repo_key === 'string' ? o.repo_key : String(o.repo_key), 160)
+    const p = typeof o.project_id === 'string' ? await project(o.project_id) : 'project ?'
+    return o.op === 'add' ? `add repository ${repo} to the allow-list of ${p}` : `remove repository ${repo} from the allow-list of ${p}`
   }
   if (action === 'action:sudo_seat_event_grant') return `let host ${await agent(o.host_agent_id)} receive the seat events of ${await agent(o.agent_id)}${typeof o.project_id === 'string' && o.project_id ? ` for ${await project(o.project_id)}` : ''}`
   return null

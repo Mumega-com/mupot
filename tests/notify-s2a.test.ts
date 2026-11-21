@@ -196,6 +196,7 @@ describe('item 4: one policy source', () => {
     'action:project_lifecycle', 'action:org_structure', 'action:workspace_project', 'action:routine_policy',
     'action:project_status', 'action:sudo_squad_member_add', 'action:sudo_squad_dyad_pin',
     'action:sudo_grant_gate_capability', 'action:sudo_seat_event_grant',
+    'action:sudo_archive_row', 'action:sudo_move_agent_squad', 'action:sudo_project_repo', // W1-2 (council-20261121-authz)
   ]
   it('the bot allow list is the carry table list, and equals the list the bot carried before the switch, in order', () => {
     expect(APPROVAL_BOT_ACTIONS).toBe(REVERSIBLE_ACTIONS)
