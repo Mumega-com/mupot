@@ -110,9 +110,9 @@ describe('W1-2 registry: exactly two new one-tap acts, tokens and moves stay out
     }
     expect([...OWNER_SUDO_ACTIONS].filter((a) => /token|credential|key/.test(a))).toEqual([])
   })
-  it('both are one-tap reversible on the bot; only archive_row is attached-sudo-able; token and move actions are not', () => {
+  it('both are one-tap reversible on the bot; neither is attached-sudo-able; token and move actions are not', () => {
     for (const a of ['action:sudo_archive_row', 'action:sudo_project_repo']) expect(classifyAction(a)).toBe('reversible')
-    expect(ATTACHED_SUDO_ACTIONS).toContain('action:sudo_archive_row')
+    expect(ATTACHED_SUDO_ACTIONS).not.toContain('action:sudo_archive_row') // Kasra gate #2488 round 2 (P-OBS); back via #2497
     expect(ATTACHED_SUDO_ACTIONS).not.toContain('action:sudo_project_repo') // add_repo widens GitHub write reach
     expect(ATTACHED_SUDO_ACTIONS).not.toContain('action:sudo_move_agent_squad')
     expect(classifyAction('action:sudo_move_agent_squad')).toBe('high_risk') // unknown to the bot: fails closed

@@ -43,7 +43,7 @@ run as the approving human (the tool sees the human's live standing; the agent i
 | `action:sudo_squad_dyad_pin` | `update_squad` | a call with only `squad`, `dyad_agent_a`, `dyad_agent_b` (and `reason`): pin or clear the review pair |
 | `action:sudo_grant_gate_capability` | `grant_gate_capability` | one `gate:<owner>` grant, org scope; never to the requesting agent or its member |
 | `action:sudo_seat_event_grant` | `seat_event_grant` (new MCP twin of `POST /api/fleet/events/grants`) | let one host receive one agent's seat events |
-| `action:sudo_archive_row` | `archive_row` | archive one task, one work squad or one INACTIVE agent; never a member, a project, a home squad or the requesting agent; from an attached chat only a row in its own agent's squads. The card shows a task's title, status, gate owner and assignee (W1-2) |
+| `action:sudo_archive_row` | `archive_row` | archive one task, one work squad or one INACTIVE agent; never a member, a project, a home squad or the requesting agent; not attached-sudo-able. The card shows a task's title, status, gate owner and assignee (W1-2) |
 | `action:sudo_project_repo` | `project_update` | a call with only `project_id` and exactly one of `add_repo` / `remove_repo`; org scope; the repo is folded with `repoKeyFromUrl` before hashing (W1-2) |
 
 Credentials (mint, list, reveal, revoke a token; register a key) are never on this list, with or without approval (council-20261121-authz).

@@ -10,15 +10,13 @@
 //     anything to the requesting agent or its own member;
 //   - the dyad pin cannot include the requesting agent; the seat-event host cannot be the requesting agent;
 //   - squad_member_add confers observer/member only and never to the requesting agent;
-//   - archive_row covers tasks, work squads and INACTIVE agents only (never members, projects, a home squad or the requester),
-//     and from an ATTACHED chat only a row in the attached agent's own squads;
+//   - archive_row covers tasks, work squads and INACTIVE agents only (never members, projects, a home squad or the requester);
 //   - project_update covers exactly ONE repository allow-list edit (add_repo or remove_repo) and nothing else.
 import type { Env } from '../types'
 import { GATE_CAPABILITY_RE } from '../gates/grants'
 import * as lanes from '../gates/lanes'
 import { untrustedLine, untrustedName } from './untrusted-line'
 import { resolveAgentRef, resolveSquadRef } from '../org/resolve'
-import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from './capability'
 import { repoKeyFromUrl } from '../workspaces/repo-key'
 
 /** OWNER_SUDO_ENABLED = '1' | 'true'. Default OFF: with it off no sudo action can be requested and resolveOwnerSudo is a no-op. */
@@ -98,25 +96,6 @@ const OPTIONAL_KEYS: Readonly<Record<SudoActionKey, readonly string[]>> = {
   'action:sudo_project_repo': [],
 }
 
-/** The squads an agent is in right now: its home squad, its live memberships, and the squads its welded member holds a live
- *  capability on. The attached archive fence reads this set at request AND use time. */
-async function agentSquadIds(env: Env, agentId: string): Promise<Set<string>> {
-  const now = nowCapabilitySql()
-  const [home, memberships, caps] = await Promise.all([
-    env.DB.prepare('SELECT squad_id FROM agents WHERE id = ?1 LIMIT 1').bind(agentId).first<{ squad_id: string | null }>(),
-    env.DB.prepare(`SELECT m.squad_id AS squad_id FROM memberships m WHERE m.agent_id = ?1 AND ${CAPABILITY_LIVE_PREDICATE('m', '?2')}`).bind(agentId, now).all<{ squad_id: string }>(),
-    env.DB.prepare(
-      `SELECT c.scope_id AS squad_id FROM capabilities c
-         JOIN agent_member_bindings b ON b.member_id = c.member_id AND b.tenant = ?3
-        WHERE b.agent_id = ?1 AND c.scope_type = 'squad' AND ${CAPABILITY_LIVE_PREDICATE('c', '?2')}`,
-    ).bind(agentId, now, env.TENANT_SLUG).all<{ squad_id: string }>(),
-  ])
-  const out = new Set<string>()
-  if (home?.squad_id) out.add(home.squad_id)
-  for (const r of [...(memberships.results ?? []), ...(caps.results ?? [])]) if (r.squad_id) out.add(r.squad_id)
-  return out
-}
-
 /** Resolve, fence and canonicalise one sudo call's arguments. `raw` is `sudo_args` at request time and the mapped tool args at use time. */
 export async function canonicalizeSudoArgs(env: Env, action: SudoActionKey, raw: unknown, who: Requester): Promise<CanonicalResult> {
   if (!isObj(raw)) return bad('sudo_args_required', `${action} needs sudo_args: { ${REQUIRED_KEYS[action].join(', ')} }`)
@@ -184,34 +163,21 @@ export async function canonicalizeSudoArgs(env: Env, action: SudoActionKey, raw:
     if (!table || !id || id.trim().length === 0) return bad('sudo_args_required', 'table and id are required')
     if (id !== id.trim()) return bad('sudo_args_invalid', 'id must be the exact row id')
     if (!SUDO_ARCHIVE_TABLES.includes(table)) return bad('sudo_archive_table_not_covered', 'an owner-sudo archive_row covers tasks, squads and inactive agents only')
-    // An ATTACHED chat archives only inside its own agent's squads: the row's squad must be one the attached agent belongs to.
-    const ownSquad = async (squadId: string | null): Promise<CanonicalResult | null> => {
-      if (who.attachedAgentId === undefined) return null
-      if (squadId !== null && (await agentSquadIds(env, who.attachedAgentId)).has(squadId)) return null
-      return bad('attached_sudo_outside_own_squads', 'an attached chat may archive only a row in its own agent\'s squads')
-    }
     if (table === 'tasks') {
       const t = await env.DB.prepare('SELECT squad_id FROM tasks WHERE id = ?1 LIMIT 1').bind(id).first<{ squad_id: string | null }>()
       if (!t) return bad('task_not_found', 'unknown task')
-      const outside = await ownSquad(t.squad_id ?? null)
-      if (outside) return outside
       return finish({ table, id }, t.squad_id ?? null)
     }
     if (table === 'squads') {
       const q = await env.DB.prepare('SELECT id, kind FROM squads WHERE id = ?1 LIMIT 1').bind(id).first<{ id: string; kind: string }>()
       if (!q) return bad('squad_not_found', 'unknown squad')
       if (q.kind !== 'work') return bad('home_squad_immutable', 'not a work squad')
-      const outside = await ownSquad(q.id)
-      if (outside) return outside
       return finish({ table, id }, q.id)
     }
     const a = await env.DB.prepare('SELECT squad_id, status FROM agents WHERE id = ?1 LIMIT 1').bind(id).first<{ squad_id: string; status: string }>()
     if (!a) return bad('agent_not_found', 'unknown agent')
     if (who.agentId && id === who.agentId) return bad('cannot_archive_self', 'a sudo call may not archive the requesting agent')
-    if (who.attachedAgentId !== undefined && id === who.attachedAgentId) return bad('cannot_archive_self', 'a sudo call may not archive the attached agent')
     if (a.status !== 'inactive') return bad('sudo_agent_not_inactive', 'an owner-sudo archive_row archives an INACTIVE agent only (deactivate_agent first)')
-    const outside = await ownSquad(a.squad_id)
-    if (outside) return outside
     return finish({ table, id }, a.squad_id)
   }
 

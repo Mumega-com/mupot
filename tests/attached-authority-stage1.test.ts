@@ -324,7 +324,7 @@ describe('Full == Helper in effect (stage 1: no widen)', () => {
     expect(attachedAuthority(authHelper as never)?.ceiling).toBe(attachedAuthority(authFull as never)?.ceiling)
     expect(ceilingCapability('member')).toBe(ceilingCapability('member'))
     expect(ceilingCapability('full')).toBeNull() // capability ceiling 'full' = agent's own standing; unrelated to Helper/Full mode
-    expect([...ATTACHED_SUDO_ACTIONS]).toEqual(['action:org_structure', 'action:sudo_seat_event_grant', 'action:sudo_archive_row']) // W1-2: same list for Helper and Full
+    expect([...ATTACHED_SUDO_ACTIONS]).toEqual(['action:org_structure', 'action:sudo_seat_event_grant'])
   })
 
   it('resolveSeatCapabilities is identical for Helper vs Full admissions with the same rank ceiling', async () => {

@@ -100,10 +100,10 @@ export function verdictAttribution(auth: Pick<AuthContext, 'seatBinding'>): Verd
  * the decision, every use in hasElevatedAction), so a row forged past one of them is still refused by the others.
  */
 export const ATTACHED_SEAT_EVENT_SUDO_ACTION = 'action:sudo_seat_event_grant'
-/** W1-2 (council-20261121-authz): the ONE hygiene act an attached chat may ask its human for: one exact archive_row, run as that
- *  human (owner-sudo.ts), and only on a row in the attached agent's OWN squads (owner-sudo-args.ts). action:sudo_project_repo is
- *  NOT here (add_repo widens GitHub write reach: the agent's own seat asks for it); move_agent_squad is not a sudo act at all. */
-export const ATTACHED_HYGIENE_SUDO_ACTIONS: readonly string[] = Object.freeze(['action:sudo_archive_row'])
+/** W1-2 (council-20261121-authz, Kasra gate #2488): NO hygiene act is attached-sudo-able. action:sudo_archive_row is out (an
+ *  observer-standing chat could archive its squad's review task; attached archive returns as its own PR, see #2497) and
+ *  action:sudo_project_repo is out (add_repo widens GitHub write reach). Both stay one-tap for a bound agent's human owner. */
+export const ATTACHED_HYGIENE_SUDO_ACTIONS: readonly string[] = Object.freeze([])
 export const ATTACHED_SUDO_ACTIONS: readonly string[] = ['action:org_structure', ATTACHED_SEAT_EVENT_SUDO_ACTION, ...ATTACHED_HYGIENE_SUDO_ACTIONS]
 
 export function isAttachedSudoAction(action: string): boolean {
