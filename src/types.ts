@@ -497,6 +497,9 @@ export interface Env {
   DECISION_GATEWAY_ID?: string
   // Clef adapter model: '@cf/cloudflare/clef-flash' (default) or '@cf/cloudflare/clef'. Anything else fails closed.
   CLEF_MODEL?: string
+  // Operator-pinned model version for Clef: strict YYYY-MM-DD (the day the operator verified the model).
+  // Used as `${CLEF_MODEL}@${date}` only when the provider returns no real version. Invalid/unset => none.
+  CLEF_MODEL_VERSION?: string
 }
 
 // ── Org domain (mirrors migrations/0001_init.sql + 0009_work_unit.sql) ──
