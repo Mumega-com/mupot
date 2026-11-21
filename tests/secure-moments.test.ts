@@ -145,8 +145,7 @@ async function fileElevation(actions = ['action:project_status', 'action:manage_
   const r = await invokeTool(agentAuth(), e, 'request_elevation',
     { actions, scope_type: 'squad', scope_id: 'squad-a', duration_minutes: minutes, reason: 'need it' }, 'https://pot.test')
   if (!r.ok) throw new Error(`elevation failed ${JSON.stringify(r)}`)
-  const res = r.result as { request: { id: string }; approve_url?: string }
-  if (!res.approve_url) throw new Error('no approve_url')
+  const res = r.result as { request: { id: string }; approve_url: string }
   return { ...parseLink(res.approve_url), url: res.approve_url, subject: res.request.id }
 }
 
@@ -262,12 +261,15 @@ describe('flag off is a true no-op', () => {
     expect(advertisedTools(off).map((t) => t.name)).not.toContain('seed_attach_request')
     expect(advertisedTools(env).map((t) => t.name)).toContain('seed_attach_request')
   })
-  it('request_elevation returns no approve_url and writes no moment while off', async () => {
+  it('request_elevation returns the web review URL and writes no moment while secure moments are off', async () => {
     await invokeTool(agentAuth(), baseEnv({ SECURE_MOMENTS: undefined }), 'check_in', {}, 'https://pot.test')
     const r = await invokeTool(agentAuth(), baseEnv({ SECURE_MOMENTS: undefined }), 'request_elevation',
       { actions: ['action:project_status'], scope_type: 'squad', scope_id: 'squad-a', duration_minutes: 60, reason: 'x' }, 'https://pot.test')
     expect(r.ok).toBe(true)
-    expect((r.result as Record<string, unknown>).approve_url).toBeUndefined()
+    const links = r.result as { approve_url: string; web_approve_url: string; secure_moment_url?: string; request: { id: string } }
+    expect(links.approve_url).toBe(`https://colony.example.test/elevation/${links.request.id}`)
+    expect(links.web_approve_url).toBe(links.approve_url)
+    expect(links.secure_moment_url).toBeUndefined()
     expect(count('secure_moments')).toBe(0)
   })
   it('issueMomentLink is null and writes nothing when off or misconfigured', async () => {
@@ -888,6 +890,15 @@ describe('elevation decision on the secure page', () => {
     expect(m.url.startsWith(`${ORIGIN}/m/`)).toBe(true)
     expect(one('SELECT kind, subject_id, requester_agent_id FROM secure_moments WHERE id = ?', m.id)).toMatchObject({ kind: 'elevation', subject_id: m.subject, requester_agent_id: 'agent-x' })
   })
+  it('routes install_high to a secure moment that approves with a registered passkey', async () => {
+    env.INSTALLER_WINDOW = '1'
+    const owner = await enrol('mem-owner', identities.owner)
+    const actions = ['action:install_high']
+    const m = await fileElevation(actions)
+    expect((await decide(m, owner, { decision: 'approve', actions, duration_minutes: 60 })).status).toBe(200)
+    expect(grants()).toEqual([{ action: 'action:install_high', approved_by_member_id: 'mem-owner' }])
+  })
+
   it('the page shows narrowing controls and the reason only inside the untrusted box', async () => {
     const m = await fileElevation()
     const html = await (await hit(m.path)).text()
@@ -1303,22 +1314,46 @@ describe('round 2 P2/P3', () => {
     }
     expect(dedicatedSecureHost(baseEnv())).toBe(HOST)
   })
-  it('request_elevation returns access_approve_url beside the secure approve_url when both channels are on (and only then)', async () => {
+  it('request_elevation keeps the enabled secure links beside the ordinary web review URL', async () => {
     const both = baseEnv({ ACCESS_APPROVE_ENABLED: '1', ACCESS_TEAM_DOMAIN: 'acme.cloudflareaccess.com', ACCESS_AUD: 'aud', ACCESS_CANONICAL_HOST: 'approve.example.test' })
     await invokeTool(agentAuth(), both, 'check_in', {}, 'https://pot.test')
     const r = await invokeTool(agentAuth(), both, 'request_elevation', { actions: ['action:project_status'], scope_type: 'squad', scope_id: 'squad-a', duration_minutes: 15, reason: 'x' }, 'https://pot.test')
     expect(r.ok).toBe(true)
-    const res = r.result as { approve_url: string; access_approve_url?: string; request: { id: string } }
+    const res = r.result as { approve_url: string; web_approve_url: string; secure_moment_url: string; access_approve_url?: string; request: { id: string } }
     expect(res.approve_url.startsWith(`${ORIGIN}/m/`)).toBe(true)
+    expect(res.secure_moment_url).toBe(res.approve_url)
+    expect(res.web_approve_url).toBe(`https://colony.example.test/elevation/${res.request.id}`)
     expect(res.access_approve_url).toBe(`https://approve.example.test/approve/elevation/${res.request.id}`)
-    // secure only: no Access link key; Access only: approve_url is the Access link, no duplicate key
-    const only = await invokeTool(agentAuth(), env, 'request_elevation', { actions: ['action:project_status'], scope_type: 'squad', scope_id: 'squad-a', duration_minutes: 15, reason: 'y' }, 'https://pot.test')
+    // Only the dedicated channels that can actually run are advertised alongside the web URL.
+    const disabledAccess = { ...both, ACCESS_APPROVE_ENABLED: '0' }
+    const only = await invokeTool(agentAuth(), disabledAccess, 'request_elevation', { actions: ['action:project_status'], scope_type: 'squad', scope_id: 'squad-a', duration_minutes: 15, reason: 'y' }, 'https://pot.test')
     expect((only.result as Record<string, unknown>).access_approve_url).toBeUndefined()
     const accessOnly = baseEnv({ SECURE_MOMENTS: undefined, ACCESS_APPROVE_ENABLED: '1', ACCESS_TEAM_DOMAIN: 'acme.cloudflareaccess.com', ACCESS_AUD: 'aud', ACCESS_CANONICAL_HOST: 'approve.example.test' })
     const a = await invokeTool(agentAuth(), accessOnly, 'request_elevation', { actions: ['action:project_status'], scope_type: 'squad', scope_id: 'squad-a', duration_minutes: 15, reason: 'z' }, 'https://pot.test')
     expect((a.result as Record<string, unknown>).access_approve_url).toBeUndefined()
-    expect((a.result as { approve_url: string }).approve_url).toMatch(/^https:\/\/approve\.example\.test\/approve\/elevation\//)
+    expect((a.result as { approve_url: string }).approve_url).toMatch(/\/elevation\/[0-9a-f-]+$/)
+    expect((a.result as { approve_url: string }).approve_url).not.toContain('/approve/')
   })
+  it('routes install_high to a passkey link even when the only available channel is Access', async () => {
+    const access = baseEnv({
+      INSTALLER_WINDOW: '1', SECURE_MOMENTS: '0', ACCESS_APPROVE_ENABLED: '1',
+      ACCESS_TEAM_DOMAIN: 'acme.cloudflareaccess.com', ACCESS_AUD: 'aud', ACCESS_CANONICAL_HOST: 'approve.example.test',
+      ACCESS_REQUIRED_AMR: 'hwk, webauthn',
+    })
+    const args = { actions: ['action:install_high'], scope_type: 'org', duration_minutes: 60, reason: 'Install fixture' }
+    await invokeTool(agentAuth(), access, 'check_in', {}, 'https://pot.test')
+    for (const e of [{ ...access, ACCESS_APPROVE_ENABLED: '0' }, { ...access, ACCESS_REQUIRED_AMR: 'hwk,pwd' }]) {
+      const r = await invokeTool(agentAuth(), e, 'request_elevation', args, 'https://pot.test')
+      expect(r).toMatchObject({ ok: false, error: 'secure_moments_unavailable', detail: expect.stringContaining('needs passkey approval') })
+      expect(count('elevation_requests')).toBe(0)
+    }
+    const r = await invokeTool(agentAuth(), access, 'request_elevation', args, 'https://pot.test')
+    if (!r.ok) throw new Error('expected a passkey approval link')
+    const links = r.result as { request: { id: string }; approve_url: string; web_approve_url: string }
+    expect(links.approve_url).toBe(`https://approve.example.test/approve/elevation/${links.request.id}`)
+    expect(links.web_approve_url).toBe(`https://colony.example.test/elevation/${links.request.id}`)
+  })
+
   it('the decision page has no inline onsubmit handler (CSP would block it) and Enter cannot submit the form', async () => {
     const m = await fileSeed()
     const html = await (await hit(m.path)).text()

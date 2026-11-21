@@ -1,8 +1,11 @@
 # Approval bot ("/muapprove")
 
 A dedicated Telegram bot, owned by the worker, that carries an agent's `request_elevation` to the deciding human as one
-message with **Approve** and **Deny** buttons. No keys, no curl, no website. OFF unless `APPROVAL_BOT_TOKEN` is set; with it
-unset `request_elevation` behaves exactly as before (Mini App button, `approve_url`).
+message with **Approve** and **Deny** buttons. The bot is off unless `APPROVAL_BOT_TOKEN` is set.
+`request_elevation` returns the secure moment in `approve_url` when it issues one and puts the dashboard URL in
+`web_approve_url`. Without a moment, ordinary requests use that dashboard URL as `approve_url`. A request for
+`action:install_high` needs a passkey approval link. When the bot delivers a card, the separate `telegram_url` opens
+the private bot chat. Mini App delivery uses the same secure moment as the browser.
 
 It is a **dedicated** bot. It is not the notification bot (`TELEGRAM_BOT_TOKEN`), not the Mini App bot, and not the
 Hermes / IM decision bot (KayHermes): config refuses a shared token or a shared webhook secret.

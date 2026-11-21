@@ -438,7 +438,7 @@ describe('MCP task cutover tools', () => {
       'https://pot.example',
     )
 
-    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_self_close' })
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_self_close', detail: expect.any(String), next_step: expect.stringMatching(/^Submit evidence.*truly superseded.*archive_propose/) })
   })
 
   it('allows a NON-assignee principal to close the same in_progress task to done', async () => {
@@ -494,7 +494,7 @@ describe('MCP task cutover tools', () => {
       'https://pot.example',
     )
 
-    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_mutate_own_assignment' })
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_cannot_mutate_own_assignment', detail: expect.any(String), next_step: expect.stringContaining('archive_propose') })
   })
 
   it('blocks the assignee from reassigning its own in_progress task to someone else (BLOCK-1 bypass closed)', async () => {
@@ -848,13 +848,12 @@ describe('MCP task cutover tools', () => {
     expect(res.error).toBe('forbidden')
   })
 
-  it('task_update refuses invalid lifecycle jumps', async () => {
+  it.each(['done', 'review'])('task_update routes an invalid jump to %s to archive_propose', async (status) => {
     const { env } = makeEnv([task({ status: 'open' })])
 
-    const res = await invokeTool(auth(), env, 'task_update', { task_id: 'task-1', status: 'done' }, 'https://pot.example')
+    const res = await invokeTool(auth(), env, 'task_update', { task_id: 'task-1', status }, 'https://pot.example')
 
-    expect(res.ok).toBe(false)
-    expect(res.error).toBe('invalid_transition')
+    expect(res).toMatchObject({ ok: false, error: 'invalid_transition', detail: { next_step: expect.stringContaining('archive_propose') } })
   })
 
   it('task_update refuses in_progress → review with no gate_owner (would be a zombie)', async () => {

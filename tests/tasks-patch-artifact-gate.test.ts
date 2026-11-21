@@ -6,10 +6,24 @@
 // tests/task-update-artifact-gate-e2e.test.ts, executed against real schema.
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { tasksApp } from '../src/tasks'
-import type { Env } from '../src/types'
+import type { AuthContext, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
+
+const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
+
+vi.mock('../src/auth', () => ({
+  requireAuth: async (
+    c: { set: (key: 'auth', value: AuthContext) => void; json: (body: unknown, status: 401) => Response },
+    next: () => Promise<void>,
+  ) => {
+    if (!authState.current) return c.json({ error: 'unauthenticated' }, 401)
+    c.set('auth', authState.current)
+    await next()
+  },
+}))
+
+const { tasksApp } = await import('../src/tasks')
 
 const VALID_SHA = '46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88'
 const DEPT_ID = 'dept-1'
@@ -27,6 +41,7 @@ beforeEach(() => {
     INSERT INTO squads (id, department_id, slug, name) VALUES ('${SQUAD_ID}', '${DEPT_ID}', 'squad-1', 'Squad 1');
     INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('${AGENT_ID}', '${SQUAD_ID}', 'agent-1', 'Agent 1', 'active');
   `)
+  authState.current = { userId: 'owner-1', email: null, role: 'owner', tenant: 'mumega' }
 })
 
 function seedTask(opts: {
@@ -81,13 +96,26 @@ function patch(body: unknown) {
 }
 
 describe('PATCH /:id — provenance-safe artifact gate (REST parity)', () => {
+  it.each(['done', 'review'] as const)('gives a human the cleanup page, not agent archival, for an invalid open → %s transition', async status => {
+    seedTask({ status: 'open', gateOwner: status === 'review' ? 'gate:reviewer' : null })
+    const res = await tasksApp.fetch(patch({ status }), makeEnv())
+    expect(res.status).toBe(400)
+    const json = (await res.json()) as { error: string; next_step: string }
+    expect(json.error).toBe('invalid_transition')
+    expect(json.next_step).toContain('/board/cleanup')
+    expect(json.next_step).not.toContain('archive_propose')
+  })
+
   it('refuses entering review with no result at all, on an agent-assigned task', async () => {
     seedTask({ gateOwner: 'gate:reviewer' })
     const res = await tasksApp.fetch(patch({ status: 'review' }), makeEnv())
     expect(res.status).toBe(409)
-    const json = (await res.json()) as { error: string; reason: string }
+    const json = (await res.json()) as { error: string; reason: string; next_step: string }
     expect(json.error).toBe('artifact_verification_failed')
     expect(json.reason).toBe('no_result')
+    expect(json.next_step).toContain('Submit evidence for review first')
+    expect(json.next_step).toContain('/board/cleanup')
+    expect(json.next_step).not.toContain('archive_propose')
   })
 
   it('refuses entering review when result is refusal prose', async () => {
@@ -114,8 +142,11 @@ describe('PATCH /:id — provenance-safe artifact gate (REST parity)', () => {
     seedTask({ gateOwner: null })
     const res = await tasksApp.fetch(patch({ status: 'done' }), makeEnv())
     expect(res.status).toBe(409)
-    const json = (await res.json()) as { error: string }
+    const json = (await res.json()) as { error: string; next_step: string }
     expect(json.error).toBe('artifact_verification_failed')
+    expect(json.next_step).toContain('Submit evidence for review first')
+    expect(json.next_step).toContain('/board/cleanup')
+    expect(json.next_step).not.toContain('archive_propose')
   })
 
   it('allows a direct done on an ungated agent-assigned task with valid evidence', async () => {
@@ -137,5 +168,28 @@ describe('PATCH /:id — provenance-safe artifact gate (REST parity)', () => {
     seedTask({ assigneeAgentId: null, gateOwner: null })
     const res = await tasksApp.fetch(patch({ status: 'done' }), makeEnv())
     expect(res.status).toBe(200)
+  })
+
+  it('gives an agent assignee evidence-first archive proposal advice when self-close is refused', async () => {
+    seedTask({ result: `Done.\nArtifact: /tmp/marker.txt\nSHA256: ${VALID_SHA}`, gateOwner: null })
+    authState.current = { userId: AGENT_ID, email: null, role: 'owner', tenant: 'mumega', boundAgentId: AGENT_ID }
+    const res = await tasksApp.fetch(patch({ status: 'done' }), makeEnv())
+    expect(res.status).toBe(409)
+    const json = (await res.json()) as { error: string; next_step: string }
+    expect(json.error).toBe('assignee_cannot_self_close')
+    expect(json.next_step).toContain('Submit evidence for review first')
+    expect(json.next_step).toContain('archive_propose')
+    expect(json.next_step).toContain('/board/cleanup')
+  })
+
+  it('gives an agent assignee archive proposal advice when self-reassignment is refused', async () => {
+    seedTask({ gateOwner: null })
+    authState.current = { userId: AGENT_ID, email: null, role: 'owner', tenant: 'mumega', boundAgentId: AGENT_ID }
+    const res = await tasksApp.fetch(patch({ assignee_agent_id: null }), makeEnv())
+    expect(res.status).toBe(409)
+    const json = (await res.json()) as { error: string; next_step: string }
+    expect(json.error).toBe('assignee_cannot_mutate_own_assignment')
+    expect(json.next_step).toContain('archive_propose')
+    expect(json.next_step).toContain('/board/cleanup')
   })
 })

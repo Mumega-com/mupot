@@ -18,6 +18,7 @@
 import type { AuthContext, Env } from '../types'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { isTaskStatus, ALL_TASK_STATUSES } from '../tasks/service'
+import { taskCloseNextStep } from '../tasks/close-next-step'
 import { type ToolSpec, type ToolOutcome, fail, done, str, hasWorkspaceAdmin } from './index'
 import type { ElevationGrantRecord } from '../auth/elevation'
 import { memberOrElevatedAgent, withElevationReceipt, type ElevationTarget } from './elevated-principal'
@@ -33,7 +34,7 @@ import {
 
 const STRING_SCHEMA = { type: 'string' }
 
-function requireOperatorOrgAdmin(auth: AuthContext): ReturnType<typeof fail> | null {
+function requireOperatorOrgAdmin(auth: AuthContext): ToolOutcome | null {
   if (auth.boundAgentId) return fail(403, 'operator_principal_required')
   if (!hasWorkspaceAdmin(auth)) return fail(403, 'forbidden', { need: 'org:admin' })
   if (!auth.memberId) return fail(403, 'forbidden', { need: 'member_identity' })
@@ -145,7 +146,12 @@ export const toolArchiveRow: ToolSpec = {
   },
   async run(auth, env, args) {
     const gateFail = requireOperatorOrgAdmin(auth)
-    if (gateFail) return gateFail
+    if (gateFail) {
+      if (!gateFail.ok && gateFail.error === 'operator_principal_required') {
+        return fail(gateFail.status, gateFail.error, { next_step: taskCloseNextStep('agent') })
+      }
+      return gateFail
+    }
 
     if (!isArchivableTable(args.table)) {
       return fail(400, 'invalid_args', `table must be one of ${ARCHIVABLE_TABLES.join(', ')}`)

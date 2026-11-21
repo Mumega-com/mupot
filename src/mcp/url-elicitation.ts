@@ -27,10 +27,11 @@ import { loadMoment, type MomentKind, type MomentRow } from '../secure-moments/s
 import { reissueMomentLink } from '../secure-moments/issue'
 import { reserveRotation } from '../secure-moments/rotate'
 import { approveUrl } from '../access/config'
-import { loadElevationRequestById, REQUEST_DECISION_WINDOW_MS } from '../auth/elevation'
+import { accessAmrConfigured, loadElevationRequestById, REQUEST_DECISION_WINDOW_MS } from '../auth/elevation'
 import { loadSeedRequest } from '../access/seed-request'
 import { resolveAgentSessionContext, loadCallerLiveAgentSession } from '../auth/agent-sessions'
 import { validateSeed } from '../seeds/validate'
+import { INSTALL_HIGH_ACTION } from '../operators/installer-tiers'
 
 /** Per-request client capabilities (2026-07-28, SEP-2575). Also accepted as a per-request fallback on older requests. */
 export const CLIENT_CAPABILITIES_META_KEY = 'io.modelcontextprotocol/clientCapabilities'
@@ -292,7 +293,7 @@ function outcomeResult(outcome: Record<string, unknown>, extra: Record<string, u
  * the link open and rotating would break the page.
  */
 async function plainLinkFallback(
-  env: Env, auth: AuthContext, kind: MomentKind, moment: MomentRow, outcome: Record<string, unknown>, action: string | null, nowMs: number,
+  env: Env, auth: AuthContext, kind: MomentKind, moment: MomentRow, outcome: Record<string, unknown>, action: string | null, nowMs: number, requiresPasskey: boolean,
 ): Promise<ToolOutcome> {
   const actionNote = action ? { elicitation_action: action } : {}
   if (!auth.memberId) return outcomeResult(outcome, actionNote)
@@ -311,10 +312,18 @@ async function plainLinkFallback(
   if (!link || link.momentId !== moment.id) {
     return outcomeResult(outcome, { ...actionNote, link_reissue: 'error' }, `${retryNote('pending')} A fresh link could not be issued right now.`)
   }
-  const access = approveUrl(env, kind === 'seed_attach' ? 'seed' : 'elevation', moment.subject_id)
+  const access = !requiresPasskey || accessAmrConfigured(env)
+    ? approveUrl(env, kind === 'seed_attach' ? 'seed' : 'elevation', moment.subject_id)
+    : null
   return outcomeResult(
     outcome,
-    { ...actionNote, approve_url: link.url, ...(access ? { access_approve_url: access } : {}), link_reissue: 'ok' },
+    {
+      ...actionNote,
+      approve_url: link.url,
+      ...(kind === 'elevation' ? { secure_moment_url: link.url } : {}),
+      ...(access ? { access_approve_url: access } : {}),
+      link_reissue: 'ok',
+    },
     'Your client did not take up the in-protocol prompt, so here is the link again: give approve_url to the human to open (a one-time link; they decide with their passkey). The previous link no longer works. Nothing is decided until they do.',
   )
 }
@@ -378,7 +387,8 @@ export async function prepareUrlElicitation(
         // Anything but an explicit accept (decline, cancel, a missing or unrecognised answer) while the request AND
         // its moment are still open: the client did not show the human the link, so hand the agent a fresh one.
         if (action !== 'accept' && outcome.status === 'pending' && moment.status === 'pending' && Date.parse(moment.expires_at) > nowMs) {
-          return plainLinkFallback(env, auth, st.k, moment, outcome, action, nowMs)
+          const requiresPasskey = st.k === 'elevation' && Array.isArray(args.actions) && args.actions.includes(INSTALL_HIGH_ACTION)
+          return plainLinkFallback(env, auth, st.k, moment, outcome, action, nowMs, requiresPasskey)
         }
         return outcomeResult(outcome, action ? { elicitation_action: action } : {})
       }

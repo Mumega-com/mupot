@@ -89,6 +89,7 @@ import {
   loadCallerLiveAgentSession,
 } from '../auth/agent-sessions'
 import {
+  accessAmrConfigured,
   createElevationRequest,
   loadElevationRequestById,
   loadLiveElevationGrantsForSession,
@@ -228,7 +229,7 @@ import { PROVISION_TOOLS, attachedSudoRefusal } from './provision'
 import { OPERATOR_TOOLS } from './operators'
 import { agentHasLiveDelegation, delegatedOperatorsEnabled } from '../operators/delegations'
 import { boundAgentMayBeInstalling, installerWindowView } from '../operators/installer-window'
-import { isInstallerAction } from '../operators/installer-tiers'
+import { INSTALL_HIGH_ACTION, isInstallerAction } from '../operators/installer-tiers'
 import { settleOpenDelegatedReceipts } from '../operators/chokepoint'
 import { toolAgentLifecycle } from './agent-lifecycle'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
@@ -283,11 +284,13 @@ import { WORKTREE_TOOLS } from './worktrees'
 import { workspacesEnabled } from '../workspaces/flag'
 import { repoProjectAnswer } from './repo-project'
 import { telegramMiniappFlag } from '../secure-moments/telegram-miniapp-config'
-import { approveUrl, accessApproveEnabled } from '../access/config'
-import { secureMomentsEnabled } from '../secure-moments/config'
+import { approveUrl, accessApproveEnabled, accessApproveStatus } from '../access/config'
+import { secureMomentsEnabled, secureMomentsStatus } from '../secure-moments/config'
 import { issueMomentLink } from '../secure-moments/issue'
 import { deliverMomentToTelegram } from '../secure-moments/telegram-miniapp-auto'
 import { deliverElevationToApprovalBot } from '../approval-bot/deliver'
+import { approvalBotStatus } from '../approval-bot/config'
+import { taskCloseNextStep } from '../tasks/close-next-step'
 import { DYAD_PIN_SUDO_STEP, SUDO_CLAIM_RELEASE_REMEDY, claimOwnerSudo, finishOwnerSudo, resolveOwnerSudo, type OwnerSudoClaim, type OwnerSudoPending } from '../auth/owner-sudo'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
@@ -972,11 +975,11 @@ function memberActor(memberId: string): { kind: 'member'; id: string } {
 // A tool returns either a value (→ 200 {ok:true, result}) or a typed error with
 // an HTTP status (→ that status, {ok:false, error}).
 // `whoami`: an optional block a refusal carries as a SIBLING of its detail (orient on an unbound session), so the refusal and the map arrive together.
-type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 429 | 500 | 501 | 502 | 503; error: string; detail?: unknown; whoami?: Whoami }
+type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 429 | 500 | 501 | 502 | 503; error: string; detail?: unknown; whoami?: Whoami; next_step?: string }
 export type ToolOutcome = { ok: true; result: unknown } | { ok: false } & ToolError
 
-export function fail(status: ToolError['status'], error: string, detail?: unknown): ToolOutcome {
-  return { ok: false, status, error, detail }
+export function fail(status: ToolError['status'], error: string, detail?: unknown, nextStep?: string): ToolOutcome {
+  return { ok: false, status, error, detail, ...(nextStep === undefined ? {} : { next_step: nextStep }) }
 }
 function failOnly(status: ToolError['status'], error: string, detail?: unknown): Extract<ToolOutcome, { ok: false }> {
   return fail(status, error, detail) as Extract<ToolOutcome, { ok: false }>
@@ -2013,7 +2016,11 @@ const toolTaskUpdate: ToolSpec = {
         if (transitionErr) {
           // A flight reap/cancel parked this task as blocked: tell the executor the one legal next step.
           const flightNext = transitionErr.error === 'invalid_transition' ? await flightChildBlockedNextStep(env, existing.id, existing.status) : null
-          return fail(400, transitionErr.error, flightNext ? { ...transitionErr, ...flightNext } : transitionErr)
+          const detail = flightNext ? { ...transitionErr, ...flightNext } : transitionErr
+          const closeRefusal = transitionErr.error === 'invalid_transition' && (args.status === 'done' || args.status === 'review')
+          return fail(400, transitionErr.error, closeRefusal
+            ? { ...detail, next_step: taskCloseNextStep(auth.boundAgentId ? 'agent' : 'human') }
+            : detail)
         }
       }
       // GATE-EXIT GUARD (mirror of PATCH /api/tasks/:id): entering 'review'
@@ -2043,10 +2050,9 @@ const toolTaskUpdate: ToolSpec = {
       // other done-write path (execute.ts's finishTask, REST PATCH). approved→done
       // stays allowed: a non-assignee verdict has already passed the gate by then.
       if (assigneeSelfClose(auth.boundAgentId, existing.status, existing.assignee_agent_id, args.status)) {
-        return fail(
-          409,
-          'assignee_cannot_self_close',
+        return fail(409, 'assignee_cannot_self_close',
           'the assignee cannot mark its own task done; move it to review so a different principal can verify and close',
+          taskCloseNextStep('agent', true),
         )
       }
       if (args.status === 'done') {
@@ -2095,6 +2101,7 @@ const toolTaskUpdate: ToolSpec = {
           return fail(409, 'artifact_verification_failed', {
             reason: artifactCheck.reason,
             ...(artifactCheck.path ? { path: artifactCheck.path } : {}),
+            next_step: taskCloseNextStep(auth.boundAgentId ? 'agent' : 'human', true),
             detail: 'an agent-assigned task can only enter review or be marked done directly when its result carries evidence: "Artifact: <path>" + "SHA256: <64-hex>" (operating and under_attack require exactly this), or (at onboarding only) a repository/PR URL with a full commit id, or a "Snapshot: <label>" with an http(s) reference',
           })
         }
@@ -2127,10 +2134,9 @@ const toolTaskUpdate: ToolSpec = {
       // cannot change assignee_agent_id on that task — self-unassign or reassign
       // to anyone else. Operators and non-assignee agents are unaffected.
       if (assigneeCannotMutateOwnAssignment(auth.boundAgentId, existing.status, existing.assignee_agent_id)) {
-        return fail(
-          409,
-          'assignee_cannot_mutate_own_assignment',
+        return fail(409, 'assignee_cannot_mutate_own_assignment',
           'the current assignee cannot change the assignee field on its own in_progress task; ask an operator or a different principal',
+          taskCloseNextStep('agent'),
         )
       }
       // #406 fast-follow (Opus re-gate WARN-1 on #404) — mirrors the same guard
@@ -3840,6 +3846,7 @@ const toolTaskSubmitResult: ToolSpec = {
       return fail(409, 'artifact_verification_failed', {
         reason: artifactCheck.reason,
         ...(artifactCheck.path ? { path: artifactCheck.path } : {}),
+        next_step: taskCloseNextStep(auth.boundAgentId ? 'agent' : 'human', true),
         detail: 'a completion result must carry evidence: "Artifact: <path>" + "SHA256: <64-hex>", or (at onboarding only) a repository/PR URL with a full commit id, or a "Snapshot: <label>" with an http(s) reference — prose describing intended work is not evidence of work done',
       })
     }
@@ -6731,7 +6738,7 @@ const toolEndAgentSession: ToolSpec = {
 // fails closed with 'not_agent_session' for those).
 const toolRequestElevation: ToolSpec = {
   name: 'request_elevation',
-  scope: 'self (exact current agent session). The reply includes `telegram`: "sent" = your human already has a Review-and-decide button in Telegram: tell them to check Telegram and do NOT paste the link or call moment_miniapp_link; "pending" = it is still being delivered, give it a moment; "not_bound" / "disabled" / "failed" / "rate_limited" = give them approve_url.',
+  scope: 'self (exact current agent session). approve_url opens the secure moment when issued, otherwise web review or the passkey approval page for install_high. web_approve_url opens the dashboard. When telegram is "sent", the human also has a card in Telegram.',
   min: 'authenticated',
   args: '{ actions: string[], scope_type: "org"|"department"|"squad", scope_id?: string, duration_minutes: number, reason: string, recommendation?: string (one line shown to the human beside your reason), sudo_args?: object (REQUIRED for every action:sudo_*: the exact call you will make, e.g. { capability, principal_type, principal_id } for action:sudo_grant_gate_capability; { squad, agent, capability } for action:sudo_squad_member_add; { squad, agent_a, agent_b } for action:sudo_squad_dyad_pin; { host_agent_id, agent_id, project_id? } for action:sudo_seat_event_grant) }',
   inputSchema: {
@@ -6787,6 +6794,12 @@ const toolRequestElevation: ToolSpec = {
     }
     if (!reason) return fail(400, 'invalid_args', 'reason required')
 
+    const requiresPasskey = actions.includes(INSTALL_HIGH_ACTION)
+    const accessCanApprove = accessApproveStatus(env).state === 'on' && (!requiresPasskey || accessAmrConfigured(env))
+    if (requiresPasskey && !accessCanApprove && secureMomentsStatus(env).state !== 'on') {
+      return fail(503, 'secure_moments_unavailable', 'action:install_high needs passkey approval. Ask an operator to enable Secure Moments or configure Access approval with passkey-only sign-in.')
+    }
+
     const result = await createElevationRequest(env, {
       tenant: env.TENANT_SLUG,
       agentSessionId: liveSession.id,
@@ -6804,11 +6817,15 @@ const toolRequestElevation: ToolSpec = {
     const moment = await issueMomentLink(env, {
       kind: 'elevation', subjectId: result.request.id, requesterAgentId: sessionContext.context.agentId, subjectExpiresAtIso: result.request.decision_expires_at,
     })
-    const accessLink = approveUrl(env, 'elevation', result.request.id)
-    const elevationLink = moment?.url ?? accessLink
-    // The approval bot (src/approval-bot/) takes the request first when it is on and may carry it: ONE message with Approve and
-    // Deny buttons from the bot only the worker drives. Otherwise (bot off, an action the bot may not carry, nobody reachable,
-    // a failed send) the Mini App button and the approve_url run exactly as before.
+    const accessLink = accessCanApprove ? approveUrl(env, 'elevation', result.request.id) : null
+    const webApprovalUrl = `${canonicalOrigin(env, ctx.origin)}/elevation/${encodeURIComponent(result.request.id)}`
+    const approvalUrl = moment?.url ?? (requiresPasskey ? accessLink : webApprovalUrl)
+    if (!approvalUrl) {
+      return fail(503, 'secure_moments_unavailable', {
+        request_id: result.request.id,
+        next_step: 'The request is pending. Ask an operator to restore passkey approval before filing another request.',
+      })
+    }
     const recommendation = str(args.recommendation)
     if (recommendation) {
       await env.DB.prepare('UPDATE elevation_requests SET recommendation = ?1 WHERE id = ?2 AND tenant = ?3')
@@ -6820,6 +6837,12 @@ const toolRequestElevation: ToolSpec = {
       fallback: moment ? () => deliverMomentToTelegram(env, { momentId: moment.momentId, requesterMemberId: null }, { waitUntil: ctx.waitUntil }) : undefined,
     })
     let telegram: string = botDelivery
+    let telegramUrl: string | undefined
+    if (botDelivery === 'sent') {
+      const bot = approvalBotStatus(env)
+      // Telegram links to individual messages are for channels and groups, not private bot chats.
+      if (bot.state === 'on') telegramUrl = `https://t.me/${bot.username}`
+    }
     if (botDelivery !== 'sent' && botDelivery !== 'pending') {
       const viaMiniapp = moment
         ? await deliverMomentToTelegram(env, { momentId: moment.momentId, requesterMemberId: null }, { waitUntil: ctx.waitUntil })
@@ -6841,12 +6864,12 @@ const toolRequestElevation: ToolSpec = {
         decision_expires_at: result.request.decision_expires_at,
       },
       note: 'Pending human approval. No authority is granted yet — poll elevation_status or wait for it to be reflected on your next call.',
-      // sent|not_bound|disabled|failed|rate_limited: whether the Telegram Mini App button reached the deciding human. The link below stays the fallback.
       telegram,
-      // Present only when a human-proof channel is enabled: the link a human opens to decide (secure moment
-      // first, else the Access approve page). This tool decides nothing.
-      ...(elevationLink ? { approve_url: elevationLink } : {}),
-      // Both channels on: the Access link stays available beside the secure one (same shape as seed_attach_request).
+      approve_url: approvalUrl,
+      web_approve_url: webApprovalUrl,
+      ...(telegramUrl ? { telegram_url: telegramUrl } : {}),
+      ...(moment ? { secure_moment_url: moment.url } : {}),
+      // Access is optional and only advertised if its dedicated approval surface is available.
       ...(moment && accessLink ? { access_approve_url: accessLink } : {}),
     })
   },
@@ -8601,16 +8624,17 @@ function mcpCallResult(tool: string, result: unknown): Record<string, unknown> {
 /** MCP tool execution error result (mupot#1667). `status` is the HTTP status REST would have used,
  *  kept in the body so agents can still tell 403/404/409 apart; `need` is lifted to the top level
  *  when the refusal detail carries one. */
-function mcpToolRefusalResult(tool: string, status: number, error: string, detail: unknown, gctx: GuideCtx = {}): Record<string, unknown> {
+function mcpToolRefusalResult(tool: string, status: number, error: string, detail: unknown, gctx: GuideCtx = {}, nextStep?: string): Record<string, unknown> {
   const need = typeof detail === 'object' && detail !== null && 'need' in detail
     ? (detail as { need?: unknown }).need // narrowed by the 'in' check above
     : undefined
   // The one refusal envelope (src/mcp/refusal-next-step.ts): who_acts always; next_step unless the tool's own detail already teaches.
   const g = refusalGuidance(error, status, detail, tool, gctx)
+  const guidance = nextStep ?? g.next_step
   const body = {
     ok: false, tool, error, status, ...(need !== undefined ? { need } : {}),
     who_acts: g.who_acts,
-    ...(g.next_step !== undefined ? { next_step: g.next_step } : {}),
+    ...(guidance !== undefined ? { next_step: guidance } : {}),
     ...(g.next_tool !== undefined ? { next_tool: g.next_tool } : {}),
     ...(g.link !== undefined ? { link: g.link } : {}),
     detail,
@@ -9295,7 +9319,7 @@ async function handleJsonRpc(
     // 2025-11-25 (SEP-1303): input validation errors are Tool Execution Errors so the model can self-correct. Only
     // for a session that negotiated that version through the URL-elicitation path (flag on); everything else keeps -32602.
     if (outcome.error === 'invalid_args' && urlElicitOn && c.req.header('mcp-protocol-version') === URL_ELICITATION_PROTOCOL_VERSION) {
-      return ok(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail, guideCtxFor(c.env, auth, ctx.origin)))
+      return ok(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail, guideCtxFor(c.env, auth, ctx.origin), outcome.next_step))
     }
     // Page-tool validator refusals (project_wiki_upsert / project_wiki_get) carry a teaching string such as
     // "purpose required: kebab, 3-32 chars". As a -32602 it rode only in error.data, which connector harnesses do
@@ -9304,7 +9328,7 @@ async function handleJsonRpc(
     // Narrow on purpose: other tools' tests pin -32602 + message 'invalid_args'. Detail strings here are static
     // validator text (lengths and limits), never request echoes or secrets.
     if (outcome.error === 'invalid_args' && typeof outcome.detail === 'string' && PAGE_TOOLS_DETAIL_AS_RESULT.has(String(outcome.tool))) {
-      return ok(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail, guideCtxFor(c.env, auth, ctx.origin)))
+      return ok(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail, guideCtxFor(c.env, auth, ctx.origin), outcome.next_step))
     }
     if (outcome.error === 'unknown_tool' || outcome.error === 'invalid_args' || outcome.error === 'invalid_request') {
       // Same -32602; the envelope rides in `data` only where the table has a specific entry (orient "agent required", check_in poll).
@@ -9315,7 +9339,7 @@ async function handleJsonRpc(
     if (outcome.status >= 500) {
       return rpcError(id, jsonRpcCodeForToolFailure(outcome.status, outcome.error), outcome.error, outcome.detail, outcome.status, refusalEnvelope(outcome.error, outcome.status, outcome.detail, outcome.tool, guideCtxFor(c.env, auth, ctx.origin)))
     }
-    return ok(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail, guideCtxFor(c.env, auth, ctx.origin)))
+    return ok(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail, guideCtxFor(c.env, auth, ctx.origin), outcome.next_step))
   }
 
   // Bearerless like initialize: discloses only protocol versions + capability names. Flag OFF
@@ -9654,7 +9678,7 @@ mcpApp.post('/', async (c) => {
   if (outcome.ok) {
     return c.json({ ok: true, tool: outcome.tool, result: outcome.result })
   }
-  return c.json({ ok: false, tool: outcome.tool, error: outcome.error, detail: outcome.detail }, outcome.status, outcome.status === 503 ? { 'Retry-After': '2' } : undefined)
+  return c.json({ ok: false, tool: outcome.tool, error: outcome.error, detail: outcome.detail, next_step: outcome.next_step }, outcome.status, outcome.status === 503 ? { 'Retry-After': '2' } : undefined)
 })
 
 // Capability tiers that may ever appear in the PUBLIC (unauthenticated) OpenAPI spec.
@@ -9822,5 +9846,5 @@ mcpActionsApp.post('/actions/:tool', async (c) => {
   }
   const outcome = (await boundAgentRefusal(c.env, auth, c.req.param('tool'))) ?? await invokeTool(auth, c.env, c.req.param('tool'), args, ctx)
   if (outcome.ok) return c.json({ ok: true, tool: outcome.tool, result: outcome.result })
-  return c.json({ ok: false, tool: outcome.tool, error: outcome.error, detail: outcome.detail }, outcome.status, outcome.status === 503 ? { 'Retry-After': '2' } : undefined)
+  return c.json({ ok: false, tool: outcome.tool, error: outcome.error, detail: outcome.detail, next_step: outcome.next_step }, outcome.status, outcome.status === 503 ? { 'Retry-After': '2' } : undefined)
 })

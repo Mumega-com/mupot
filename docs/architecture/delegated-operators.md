@@ -139,12 +139,13 @@ The product shape: "I am working with this chat; when I need my access I sudo, d
 An attached chat (W2 `seat_attach`) acts with min(human's live standing, the agent's own grants, the admission ceiling) and holds
 no admin of its own. Its one way up is `request_elevation`, per action, never blanket:
 
-- **What it may ask for.** Only the actions in `ATTACHED_SUDO_ACTIONS` (`src/auth/attached-ceiling.ts`): today **`action:org_structure`**
-  alone (rename a work department, update a squad: reversible, lowers a budget cap only). Everything else is refused with
+- **What it may ask for.** Only the actions in `ATTACHED_SUDO_ACTIONS` (`src/auth/attached-ceiling.ts`): `action:org_structure`
+  (rename a work department or update a squad) and `action:sudo_seat_event_grant` (one exact request for its own agent’s
+  wake hints, delivered to a different eligible host). Everything else is refused with
   `attached_seat_cannot_elevate` (`mint_token`, `manage_access`, `register_key`, `deploy`, `migrate`, `secrets`,
   `org_department_create`, `routine_archive`, `home_access`, every gate power). The list is one exported const, enforced at three
-  points (the request, the decision, every use in `hasElevatedAction`), so adding a key is a reviewed one-line change that must be
-  reversible, must not mint or widen authority, and must be wired to a tool safe for an attached chat.
+  points (the request, the decision, every use in `hasElevatedAction`). Seat-event sudo checks the exact agent and host
+  again at use time, and the attachment must still be live when the single-use approval is claimed.
 - **Whose session.** The request binds to the attachment's OWN agent session, the same resolution every elevation uses: the session
   is keyed on the attachment's own credential (`agent_seat_attachments.seat_token_id`, a token minted for that one attachment).
   A second chat attached to the same agent, the agent's own session and the human's plain seat do not inherit the grant.

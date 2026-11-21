@@ -50,7 +50,7 @@ import {
   isValidElevationDuration,
 } from './elevation-actions'
 import { installerRequestRefusal, installerWindowEnabled, isInstallerAction } from '../operators/installer-tiers'
-import { attachedAuthority, isAttachedSudoAction } from './attached-ceiling'
+import { attachedAuthority, ATTACHED_SEAT_EVENT_SUDO_ACTION, isAttachedSudoAction } from './attached-ceiling'
 import { canonicalizeSudoArgs, ownerSudoEnabled, type SudoActionKey } from './owner-sudo-args'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from './token-lifecycle'
 
@@ -111,7 +111,7 @@ const PASSKEY_CLASS_AMR: ReadonlySet<string> = new Set(['hwk', 'swk', 'webauthn'
 
 /** True when ACCESS_REQUIRED_AMR is non-empty and every value is passkey-class (config.ts reads the same list): one weaker value
  *  (e.g. pwd) would let any fresh Access login satisfy "passkey only". */
-function accessAmrConfigured(env: Env): boolean {
+export function accessAmrConfigured(env: Env): boolean {
   const vals = (env.ACCESS_REQUIRED_AMR ?? '').split(',').map((v) => v.trim().toLowerCase()).filter((v) => v.length > 0)
   return vals.length > 0 && vals.every((v) => PASSKEY_CLASS_AMR.has(v))
 }
@@ -192,8 +192,23 @@ export async function createElevationRequest(
     if (uniqueActions[0] === 'action:sudo_grant_gate_capability' && input.scopeType !== 'org') {
       return { ok: false, reason: 'invalid_elevation_request', detail: 'action:sudo_grant_gate_capability is org scope' }
     }
-    // The exact call: mandatory, resolved, fenced, canonicalised. The same canonicaliser judges the call at use time.
-    sudoCanonical = await canonicalizeSudoArgs(env, uniqueActions[0] as SudoActionKey, input.sudoArgs, { agentId: input.agentId, memberId: input.memberId })
+    // Derive the attached requester from the stored session, not from the proposed host or agent.
+    let attachedAgentId: string | undefined
+    if (uniqueActions[0] === ATTACHED_SEAT_EVENT_SUDO_ACTION) {
+      const session = await loadAgentSessionById(env, input.tenant, input.agentSessionId)
+      if (!session || session.agent_id !== input.agentId || session.member_id !== input.memberId || !evaluateAgentSession(session, nowMs).ok) {
+        return { ok: false, reason: 'invalid_elevation_request', detail: 'the requesting agent session is not live' }
+      }
+      const origin = await loadAttachmentOriginOfSession(env, input.tenant, session.credential_id)
+      if (origin && (!origin.live || origin.agentId !== input.agentId)) {
+        return { ok: false, reason: 'invalid_elevation_request', detail: 'the requesting attachment is not live' }
+      }
+      attachedAgentId = origin?.agentId
+    }
+    // The same canonicaliser fences and hashes the exact call at request and use time.
+    sudoCanonical = await canonicalizeSudoArgs(env, uniqueActions[0] as SudoActionKey, input.sudoArgs, {
+      agentId: input.agentId, memberId: input.memberId, attachedAgentId,
+    })
     if (!sudoCanonical.ok) {
       return { ok: false, reason: 'invalid_elevation_request', detail: `${sudoCanonical.error}: ${sudoCanonical.detail}` }
     }

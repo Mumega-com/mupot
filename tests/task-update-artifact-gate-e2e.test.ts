@@ -9,7 +9,8 @@
 // (execute.ts) does NOT reach: an ungated task's direct PATCH-to-done.
 
 import { beforeEach, describe, expect, it } from 'vitest'
-import { invokeTool } from '../src/mcp'
+import { invokeTool, mcpActionsApp, mcpApp } from '../src/mcp'
+import { sha256Hex } from '../src/members/service'
 import type { AuthContext, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
@@ -62,6 +63,47 @@ let harness: SqliteD1Harness
 let env: Env
 
 describe('task_update artifact gate — real schema (mupot#76e25fc2, FLIGHT-07B)', () => {
+  it('keeps self-close detail a string and exposes next_step on MCP and REST actions', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seed(harness.sqlite, { status: 'in_progress', gateOwner: null, result: null, assigneeAgentId: AGENT_ID })
+    harness.sqlite.prepare(`
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES (?, ?, ?, datetime('now'))
+    `).run(TENANT, AGENT_ID, MEMBER_ID)
+    harness.sqlite.prepare(`
+      INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
+        VALUES ('tok-close', ?, ?, 'fixture', 'workspace', datetime('now'), ?, ?)
+    `).run(MEMBER_ID, await sha256Hex('close-fixture'), AGENT_ID, TENANT)
+    env = { TENANT_SLUG: TENANT, DB: harness.db } as Env
+
+    const args = { task_id: TASK_ID, status: 'done' }
+    const headers = { authorization: 'Bearer close-fixture', 'content-type': 'application/json' }
+    const expected = {
+      error: 'assignee_cannot_self_close',
+      detail: 'the assignee cannot mark its own task done; move it to review so a different principal can verify and close',
+      next_step: expect.stringMatching(/^Submit evidence.*truly superseded.*archive_propose/),
+    }
+    const mcp = await mcpApp.request(URL, {
+      method: 'POST', headers,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'task_update', arguments: args } }),
+    }, env)
+    expect(mcp.status).toBe(200)
+    const { result } = await mcp.json() as {
+      result: { isError: boolean; structuredContent: unknown; content: { text: string }[] }
+    }
+    expect(result.isError).toBe(true)
+    expect(result.structuredContent).toMatchObject(expected)
+    expect(JSON.parse(result.content[0].text)).toEqual(result.structuredContent)
+
+    const rest = await mcpActionsApp.request(`${URL}/actions/task_update`, {
+      method: 'POST', headers, body: JSON.stringify(args),
+    }, env)
+    expect(rest.status).toBe(409)
+    expect(await rest.json()).toMatchObject(expected)
+    harness.close()
+  })
+
   describe('entering review', () => {
     it('REFUSES entering review when result is missing entirely', async () => {
       harness = createSqliteD1()
@@ -83,7 +125,7 @@ describe('task_update artifact gate — real schema (mupot#76e25fc2, FLIGHT-07B)
       env = { TENANT_SLUG: TENANT, DB: harness.db } as Env
 
       const res = await invokeTool(callerAuth(), env, 'task_update', { task_id: TASK_ID, status: 'review' }, URL)
-      expect(res).toMatchObject({ ok: false, status: 409, error: 'artifact_verification_failed', detail: { reason: 'refusal_prose' } })
+      expect(res).toMatchObject({ ok: false, status: 409, error: 'artifact_verification_failed', detail: { reason: 'refusal_prose', next_step: expect.stringMatching(/^Submit evidence.*truly superseded.*archive_propose/) } })
     })
 
     it('REJECTS result as an unknown arg (400 invalid_args) (#1388)', async () => {

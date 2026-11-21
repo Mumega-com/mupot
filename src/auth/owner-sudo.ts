@@ -17,7 +17,7 @@
 //
 // EVERY CONDITION (re-derived per call, nothing cached; each has a test that breaks it):
 //   0. OWNER_SUDO_ENABLED is on (default off: this module is then a no-op);
-//   1. the caller is a bound agent that is NOT an attached chat (attached chats may use only ATTACHED_SUDO_ACTIONS);
+//   1. the caller is a bound agent. An attached chat may only use an exact seat-event grant for its own agent;
 //   2. the call's arguments canonicalise (owner-sudo-args.ts, with its fences) to EXACTLY the digest the human approved, and to a scope;
 //   3. hasElevatedAction, literal action: the agent's own live session, a live unexpired unrevoked grant covering THIS scope,
 //      the approver's CURRENT admin authority (incl. the owner's legacy role plane) and the approver's session still live;
@@ -41,7 +41,8 @@ import {
   type HasElevatedActionOptions,
 } from './elevation'
 import { finishElevationReceipt } from './elevation-receipt'
-import { attachedAuthority } from './attached-ceiling'
+import { attachedAuthority, ATTACHED_SEAT_EVENT_SUDO_ACTION } from './attached-ceiling'
+import { LIVE_ATTACHMENT_FROM_SQL, liveAttachmentConditionsSql, seatTokenLiveSql, type LivePh } from '../members/attach-live-sql'
 
 /** The one call that pins a squad's review pair, for an agent that cannot: shown on every dyad refusal (hint on the floor, detail in the tool). */
 export const DYAD_PIN_SUDO_STEP = 'Ask your human to approve ONE exact call: request_elevation { actions: ["action:sudo_squad_dyad_pin"], scope_type: "squad", scope_id: <the squad id>, duration_minutes: 15, reason, sudo_args: { squad, agent_a, agent_b } }. They see those names in Telegram and tap Approve. Then call update_squad with only squad, dyad_agent_a and dyad_agent_b, exactly as approved.'
@@ -86,7 +87,10 @@ async function planFor(env: Env, auth: AuthContext, tool: OwnerSudoTool, args: R
   if (!raw) {
     return refusal(403, 'sudo_covers_dyad_pin_only', { remedy: 'this approval covers ONE update_squad call that sets or clears the dyad pair and changes nothing else (squad, dyad_agent_a, dyad_agent_b, reason only)' })
   }
-  const canon = await canonicalizeSudoArgs(env, action, raw, { agentId: auth.boundAgentId ?? null, memberId: auth.memberId ?? null })
+  const canon = await canonicalizeSudoArgs(env, action, raw, {
+    agentId: auth.boundAgentId ?? null, memberId: auth.memberId ?? null,
+    attachedAgentId: attachedAuthority(auth)?.agentId,
+  })
   if (!canon.ok) return refusal(canon.error === 'agent_not_visible' ? 404 : canon.error.endsWith('_not_found') ? 404 : canon.error === 'sudo_args_required' || canon.error === 'sudo_args_invalid' || canon.error === 'invalid_capability' || canon.error === 'invalid_principal_type' ? 400 : 403, canon.error, canon.detail)
   if (tool === 'squad_member_add') {
     // ADD, never demote: the call may raise a standing, never lower one the agent already holds (both planes: the higher of
@@ -146,6 +150,13 @@ export interface OwnerSudoPending {
   executorAgentId: string
   tenant: string
   detail: Record<string, unknown>
+  attachment?: {
+    id: string
+    seatId: string
+    grantTokenId: string
+    humanMemberId: string
+    credentialId: string
+  }
 }
 
 export type OwnerSudoVerdict =
@@ -155,16 +166,25 @@ export type OwnerSudoVerdict =
 
 /**
  * Decide whether THIS call runs as the approving human. `none` = this is not a sudo situation (not an agent, not a sudo tool,
- * an attached chat, or the agent holds no live grant for the tool's action): the caller proceeds exactly as before this module
+ * an ineligible attached chat, or the agent holds no live grant for the tool's action): the caller proceeds as before this module
  * existed, and the tool's own refusal stands. `refused` = the agent holds a grant for the action but this call is not covered.
  * Writes nothing.
  */
 export async function resolveOwnerSudo(env: Env, auth: AuthContext, toolName: string, args: Record<string, unknown>, nowMs: number = Date.now()): Promise<OwnerSudoVerdict> {
   if (!ownerSudoEnabled(env)) return { kind: 'none' } // flag off: a total no-op
   if (!auth.boundAgentId || !isOwnerSudoTool(toolName)) return { kind: 'none' }
-  if (attachedAuthority(auth)) return { kind: 'none' }
   const tool: OwnerSudoTool = toolName
   const action = OWNER_SUDO_ACTION_FOR_TOOL[tool]
+  const attached = attachedAuthority(auth)
+  const binding = auth.seatBinding
+  let attachment: OwnerSudoPending['attachment']
+  if (attached) {
+    if (action !== ATTACHED_SEAT_EVENT_SUDO_ACTION || attached.agentId !== auth.boundAgentId || !binding || !auth.tokenId) {
+      return { kind: 'none' }
+    }
+    attachment = { id: attached.attachmentId, seatId: binding.seatId, grantTokenId: binding.grantTokenId,
+      humanMemberId: attached.humanMemberId, credentialId: auth.tokenId }
+  }
   // A cheap existence probe, so an agent with no sudo grant for this tool sees byte-for-byte the refusal it always saw.
   if (!(await boundAgentHasAnyLiveGrantForAction(env, auth, action, nowMs))) return { kind: 'none' }
 
@@ -214,7 +234,7 @@ export async function resolveOwnerSudo(env: Env, auth: AuthContext, toolName: st
     tool,
     squadId: planned.plan.squadId,
   }
-  return { kind: 'sudo', memberAuth, pending: { grant, tool, executorAgentId: auth.boundAgentId, tenant: auth.tenant, detail: planned.plan.detail } }
+  return { kind: 'sudo', memberAuth, pending: { grant, tool, executorAgentId: auth.boundAgentId, tenant: auth.tenant, detail: planned.plan.detail, attachment } }
 }
 
 export const SUDO_ALREADY_USED: SudoRefusal = {
@@ -250,19 +270,28 @@ export async function claimOwnerSudo(env: Env, pending: OwnerSudoPending, nowMs:
   const usageId = crypto.randomUUID()
   const nowIso = new Date(nowMs).toISOString()
   const g = pending.grant
-  const claimed = await env.DB.prepare(
-    `INSERT INTO elevation_usage_log (id, tenant, elevation_grant_id, agent_session_id, action, tool_name, detail_json, occurred_at, status)
-     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending'
-      WHERE EXISTS (SELECT 1 FROM elevation_grants WHERE id = ?3 AND tenant = ?2 AND created_at = ?9 AND revoked_at IS NULL AND expires_at > ?8)
-        AND NOT EXISTS (SELECT 1 FROM elevation_usage_log WHERE elevation_grant_id = ?3 AND status IN ('pending', 'applied') AND occurred_at >= ?9)`,
-  ).bind(
+  // An attached session must still own the approval when the one-use receipt is claimed.
+  // Reuse the same attachment and token predicates that decided its live identity.
+  const a = pending.attachment
+  const ph: LivePh = (key) => ({ tenant: '?2', seat: '?11', grantToken: '?12', human: '?13', now: '?8' })[key]
+  const liveGrant = `SELECT 1 FROM elevation_grants WHERE id = ?3 AND tenant = ?2 AND created_at = ?9 AND revoked_at IS NULL AND expires_at > ?8
+    ${a ? `AND EXISTS (SELECT 1 FROM ${LIVE_ATTACHMENT_FROM_SQL}
+      JOIN member_tokens t ON ${seatTokenLiveSql(ph)}
+      WHERE att.id = ?10 AND t.id = ?14 AND ${liveAttachmentConditionsSql(env, ph)})` : ''}`
+  const values = [
     usageId, pending.tenant, g.id, g.agent_session_id, g.action, pending.tool,
     JSON.stringify({ ...pending.detail, authority_member_id: g.approved_by_member_id }), nowIso,
     g.created_at, // the generation the caller resolved: a renewed grant keeps its id but is a different approval
-  ).run()
+    ...(a ? [a.id, a.seatId, a.grantTokenId, a.humanMemberId, a.credentialId] : []),
+  ]
+  const claimed = await env.DB.prepare(
+    `INSERT INTO elevation_usage_log (id, tenant, elevation_grant_id, agent_session_id, action, tool_name, detail_json, occurred_at, status)
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending'
+      WHERE EXISTS (${liveGrant})
+        AND NOT EXISTS (SELECT 1 FROM elevation_usage_log WHERE elevation_grant_id = ?3 AND status IN ('pending', 'applied') AND occurred_at >= ?9)`,
+  ).bind(...values).run()
   if (Number(claimed.meta?.changes ?? 0) !== 1) {
-    const live = await env.DB.prepare('SELECT 1 AS x FROM elevation_grants WHERE id = ?1 AND tenant = ?2 AND created_at = ?3 AND revoked_at IS NULL AND expires_at > ?4 LIMIT 1')
-      .bind(g.id, pending.tenant, g.created_at, nowIso).first<{ x: number }>()
+    const live = await env.DB.prepare(`${liveGrant} LIMIT 1`).bind(...values).first()
     return { ok: false, refusal: live ? SUDO_ALREADY_USED : SUDO_GRANT_ENDED }
   }
   const claim: OwnerSudoClaim = { grant: g, usageId, authorityMemberId: g.approved_by_member_id, executorAgentId: pending.executorAgentId, tool: pending.tool }

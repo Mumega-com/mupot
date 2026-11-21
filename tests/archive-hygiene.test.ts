@@ -759,6 +759,8 @@ describe('archive substrate (mupot#1496)', () => {
     expect(agentBound.ok).toBe(false)
     if (agentBound.ok) return
     expect(agentBound.error).toBe('operator_principal_required')
+    expect(agentBound.detail).toMatchObject({ next_step: expect.stringContaining('archive_propose') })
+    expect(agentBound.detail).toMatchObject({ next_step: expect.stringContaining('/board/cleanup') })
     expect(await env.DB.prepare('SELECT 1 FROM tasks_archive_state').first()).toBeNull()
   })
 
