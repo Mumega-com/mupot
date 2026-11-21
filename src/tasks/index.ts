@@ -39,6 +39,7 @@ import type { TaskStatus, VerdictIndependenceWaiver } from './service'
 import { resolveTaskAssignee, resolveTaskAssigneeMember, assigneeChangesOwnGate } from './assignee'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
 import { verifyTaskEvidence } from './evidence'
+import { ARCHIVE_PROPOSE_NEXT_STEP, withArchiveProposeNextStep } from './close-next-step'
 import { actorOf } from '../policy/bar'
 import { hasIndependentRuntimeGate, isMemberAffiliatedWithAssigneeAgent, listTaskDispatchReceiptTimeline } from './runtime-receipts'
 import { findVerdictIndependenceConflict, findVerdictIndependenceConflicts, ownsTaskPartyAgent, holdsOwnerSelfVerdictAuthority, type VerdictConflictKind } from './verdict-independence'
@@ -920,7 +921,8 @@ tasksApp.patch('/:id', async (c) => {
       })
       if (transitionErr) {
         const flightNext = transitionErr.error === 'invalid_transition' ? await flightChildBlockedNextStep(c.env, existing.id, existing.status) : null
-        return c.json(flightNext ? { ...transitionErr, ...flightNext } : transitionErr, 400)
+        const refusal = flightNext ? { ...transitionErr, ...flightNext } : transitionErr
+        return c.json(body.status === 'done' || body.status === 'review' ? withArchiveProposeNextStep(refusal) : refusal, 400)
       }
       // Security Bar open->blocked: the reason becomes part of the task body (the audit trail on the task itself).
       if (existing.status === 'open' && body.status === 'blocked' && typeof body.reason === 'string') {
@@ -976,6 +978,7 @@ tasksApp.patch('/:id', async (c) => {
         {
           error: 'assignee_cannot_self_close',
           detail: 'the assignee cannot mark its own task done; move it to review so a different principal can verify and close',
+          next_step: ARCHIVE_PROPOSE_NEXT_STEP,
         },
         409,
       )
@@ -1013,6 +1016,7 @@ tasksApp.patch('/:id', async (c) => {
             reason: artifactCheck.reason,
             ...(artifactCheck.path ? { path: artifactCheck.path } : {}),
             detail: 'an agent-assigned task can only enter review or be marked done directly when its result carries evidence: "Artifact: <path>" + "SHA256: <64-hex>" (required at operating and under_attack), or (at onboarding only) a repository/PR URL with a full commit id, or a "Snapshot: <label>" with an http(s) reference',
+            next_step: ARCHIVE_PROPOSE_NEXT_STEP,
           },
           409,
         )
@@ -1102,6 +1106,7 @@ tasksApp.patch('/:id', async (c) => {
         {
           error: 'assignee_cannot_mutate_own_assignment',
           detail: 'the current assignee cannot change the assignee field on its own in_progress task; ask an operator or a different principal',
+          next_step: ARCHIVE_PROPOSE_NEXT_STEP,
         },
         409,
       )

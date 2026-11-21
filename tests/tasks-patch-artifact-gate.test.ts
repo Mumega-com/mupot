@@ -85,9 +85,11 @@ describe('PATCH /:id — provenance-safe artifact gate (REST parity)', () => {
     seedTask({ gateOwner: 'gate:reviewer' })
     const res = await tasksApp.fetch(patch({ status: 'review' }), makeEnv())
     expect(res.status).toBe(409)
-    const json = (await res.json()) as { error: string; reason: string }
+    const json = (await res.json()) as { error: string; reason: string; next_step: string }
     expect(json.error).toBe('artifact_verification_failed')
     expect(json.reason).toBe('no_result')
+    expect(json.next_step).toContain('archive_propose')
+    expect(json.next_step).toContain('/board/cleanup')
   })
 
   it('refuses entering review when result is refusal prose', async () => {
@@ -114,8 +116,10 @@ describe('PATCH /:id — provenance-safe artifact gate (REST parity)', () => {
     seedTask({ gateOwner: null })
     const res = await tasksApp.fetch(patch({ status: 'done' }), makeEnv())
     expect(res.status).toBe(409)
-    const json = (await res.json()) as { error: string }
+    const json = (await res.json()) as { error: string; next_step: string }
     expect(json.error).toBe('artifact_verification_failed')
+    expect(json.next_step).toContain('archive_propose')
+    expect(json.next_step).toContain('/board/cleanup')
   })
 
   it('allows a direct done on an ungated agent-assigned task with valid evidence', async () => {
