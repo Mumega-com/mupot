@@ -1,8 +1,8 @@
 // mupot — OWNER SUDO ("/muapprove = sudo"; SENSITIVE).
 //
-// Seven owner-only acts refuse every agent (`operator_principal_required` / org admin): squad_member_add, the update_squad dyad pin,
-// grant_gate_capability, the seat-event grant, archive_row (tasks, squads, inactive agents), move_agent_squad (into a squad the
-// agent already belongs to) and the project_update repository allow-list edit (add_repo / remove_repo). This module is the ONE way an agent gets one call of one of them, and only
+// Six owner-only acts refuse every agent (`operator_principal_required` / org admin): squad_member_add, the update_squad dyad pin,
+// grant_gate_capability, the seat-event grant, archive_row (tasks, squads, inactive agents) and the project_update repository
+// allow-list edit (add_repo / remove_repo). move_agent_squad is deliberately NOT one (it hands the agent to another squad's leads). This module is the ONE way an agent gets one call of one of them, and only
 // with a LIVE, human-approved elevation whose action names exactly that tool and covers exactly that scope:
 //
 //   action:sudo_squad_member_add      squad_member_add
@@ -10,7 +10,6 @@
 //   action:sudo_grant_gate_capability grant_gate_capability
 //   action:sudo_seat_event_grant      seat_event_grant
 //   action:sudo_archive_row           archive_row, tasks / work squads / inactive agents only
-//   action:sudo_move_agent_squad      move_agent_squad, only into a work squad the agent already belongs to, at most its held standing
 //   action:sudo_project_repo          project_update, only when the call is ONE add_repo or remove_repo and changes nothing else
 // Credentials (mint, list, reveal, revoke a token) are deliberately NOT on this list: no approval lets an agent handle them.
 //
@@ -55,7 +54,7 @@ export const DYAD_PIN_SUDO_STEP = 'Ask your human to approve ONE exact call: req
 /** The one call that edits a project's repository allow-list, for an agent that cannot: shown on the floor refusal of a repo edit. */
 export const PROJECT_REPO_SUDO_STEP = 'Ask your human to approve ONE exact call: request_elevation { actions: ["action:sudo_project_repo"], scope_type: "org", duration_minutes: 15, reason, sudo_args: { project_id, op: "add"|"remove", repo } }. They see the project and repository in Telegram and tap Approve. Then call project_update with only project_id and add_repo (or remove_repo), exactly as approved.'
 
-export type OwnerSudoTool = 'squad_member_add' | 'update_squad' | 'grant_gate_capability' | 'seat_event_grant' | 'archive_row' | 'move_agent_squad' | 'project_update'
+export type OwnerSudoTool = 'squad_member_add' | 'update_squad' | 'grant_gate_capability' | 'seat_event_grant' | 'archive_row' | 'project_update'
 
 /** tool -> the ONE action that opens it. The ratchet test pins this map against OWNER_SUDO_ACTIONS in both directions. */
 export const OWNER_SUDO_ACTION_FOR_TOOL: Readonly<Record<OwnerSudoTool, string>> = Object.freeze({
@@ -64,7 +63,6 @@ export const OWNER_SUDO_ACTION_FOR_TOOL: Readonly<Record<OwnerSudoTool, string>>
   grant_gate_capability: 'action:sudo_grant_gate_capability',
   seat_event_grant: 'action:sudo_seat_event_grant',
   archive_row: 'action:sudo_archive_row',
-  move_agent_squad: 'action:sudo_move_agent_squad',
   project_update: 'action:sudo_project_repo',
 })
 
@@ -73,7 +71,6 @@ const SUDO_CALL_SHAPE: Partial<Record<OwnerSudoTool, string>> = {
   update_squad: 'this approval covers ONE update_squad call that sets or clears the dyad pair and changes nothing else (squad, dyad_agent_a, dyad_agent_b, reason only)',
   project_update: 'this approval covers ONE project_update call with project_id and exactly one of add_repo / remove_repo, and nothing else',
   archive_row: 'this approval covers ONE archive_row call (table, id, reason, expected_status only)',
-  move_agent_squad: 'this approval covers ONE move_agent_squad call (agent, to_squad, capability, reason only)',
 }
 
 export function isOwnerSudoTool(name: string): name is OwnerSudoTool {
@@ -151,7 +148,6 @@ function checkGrant(env: Env, auth: AuthContext, tool: OwnerSudoTool, plan: Plan
   if (tool === 'update_squad') return hasElevatedAction(env, auth, 'action:sudo_squad_dyad_pin', plan.scopeType, plan.scopeId, opts)
   if (tool === 'grant_gate_capability') return hasElevatedAction(env, auth, 'action:sudo_grant_gate_capability', plan.scopeType, plan.scopeId, opts)
   if (tool === 'archive_row') return hasElevatedAction(env, auth, 'action:sudo_archive_row', plan.scopeType, plan.scopeId, opts)
-  if (tool === 'move_agent_squad') return hasElevatedAction(env, auth, 'action:sudo_move_agent_squad', plan.scopeType, plan.scopeId, opts)
   if (tool === 'project_update') return hasElevatedAction(env, auth, 'action:sudo_project_repo', plan.scopeType, plan.scopeId, opts)
   return hasElevatedAction(env, auth, 'action:sudo_seat_event_grant', plan.scopeType, plan.scopeId, opts)
 }

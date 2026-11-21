@@ -1531,7 +1531,6 @@ const ELEVATION_ACTION_BY_TOOL: Readonly<Record<string, string>> = Object.freeze
   grant_gate_capability: 'action:sudo_grant_gate_capability',
   seat_event_grant: 'action:sudo_seat_event_grant',
   archive_row: 'action:sudo_archive_row',
-  move_agent_squad: 'action:sudo_move_agent_squad',
 })
 
 /** elevationHint — the refusal hint naming request_elevation + the action key
@@ -1554,7 +1553,6 @@ const ELEVATION_SCOPE_HINT_BY_TOOL: Readonly<Record<string, string>> = Object.fr
   grant_gate_capability: 'scope_type "org", duration_minutes 15 and sudo_args = the exact call (it covers ONE call, run as your human)',
   seat_event_grant: 'scope_type "squad" with scope_id = the target agent\'s squad id, duration_minutes 15 and sudo_args = the exact call (it covers ONE call, run as your human)',
   archive_row: 'scope_type "squad" with scope_id = the squad of the row (the task\'s squad, the squad itself, or the agent\'s squad), duration_minutes 15 and sudo_args = { table, id } (tasks, squads or inactive agents; it covers ONE call, run as your human)',
-  move_agent_squad: 'scope_type "squad" with scope_id = to_squad\'s id, duration_minutes 15 and sudo_args = { agent, to_squad, capability } (only into a squad the agent is already a member of; ONE call, run as your human)',
 })
 
 export function elevationRemedyMessage(reason: ElevatedActionDenyReason): string {

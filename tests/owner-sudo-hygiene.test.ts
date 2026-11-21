@@ -1,7 +1,7 @@
-// tests/owner-sudo-hygiene.test.ts — W1-2 (council-20261121-authz): the three hygiene acts that refused every agent-bound caller
-// even with a standing go (archive_row, move_agent_squad, project_update add_repo/remove_repo) clear with ONE human-approved tap
-// through owner sudo, and nothing else widens. Same harness as tests/owner-sudo.test.ts: real migrated schema, the REAL tools
-// through invokeTool, the REAL approval-bot decision path; only the Bot API (global fetch) is stubbed.
+// tests/owner-sudo-hygiene.test.ts — W1-2 (council-20261121-authz): the two hygiene acts that refused every agent-bound caller
+// even with a standing go (archive_row, project_update add_repo/remove_repo) clear with ONE human-approved tap through owner
+// sudo, and nothing else widens. move_agent_squad is deliberately NOT a sudo act (Kasra's gate on #2488).
+// Same harness as tests/owner-sudo.test.ts: real migrated schema, the REAL tools through invokeTool, the REAL approval-bot decision path; only the Bot API (global fetch) is stubbed.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { invokeTool } from '../src/mcp/index' // first: the mcp/seeds modules form an import cycle that only resolves from mcp/index
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
@@ -99,21 +99,23 @@ beforeEach(() => {
 })
 afterEach(() => { harness.close(); vi.unstubAllGlobals() })
 
-describe('W1-2 registry: exactly three new one-tap acts, tokens stay out', () => {
-  it('the owner-sudo map is exactly the seven tools, and no credential tool is on it', () => {
+describe('W1-2 registry: exactly two new one-tap acts, tokens and moves stay out', () => {
+  it('the owner-sudo map is exactly the six tools, and no credential tool or move_agent_squad is on it', () => {
     expect(Object.keys(OWNER_SUDO_ACTION_FOR_TOOL).sort()).toEqual([
-      'archive_row', 'grant_gate_capability', 'move_agent_squad', 'project_update', 'seat_event_grant', 'squad_member_add', 'update_squad',
+      'archive_row', 'grant_gate_capability', 'project_update', 'seat_event_grant', 'squad_member_add', 'update_squad',
     ])
+    expect([...OWNER_SUDO_ACTIONS]).not.toContain('action:sudo_move_agent_squad')
     for (const t of ['mint_agent_token', 'list_agent_tokens', 'revoke_agent_token', 'reveal_credential_claim', 'register_agent_key']) {
       expect(Object.keys(OWNER_SUDO_ACTION_FOR_TOOL)).not.toContain(t)
     }
     expect([...OWNER_SUDO_ACTIONS].filter((a) => /token|credential|key/.test(a))).toEqual([])
   })
-  it('the three are attached-sudo-able, one-tap reversible on the bot, and token actions are not', () => {
-    for (const a of ['action:sudo_archive_row', 'action:sudo_move_agent_squad', 'action:sudo_project_repo']) {
-      expect(ATTACHED_SUDO_ACTIONS).toContain(a)
-      expect(classifyAction(a)).toBe('reversible')
-    }
+  it('both are one-tap reversible on the bot; only archive_row is attached-sudo-able; token and move actions are not', () => {
+    for (const a of ['action:sudo_archive_row', 'action:sudo_project_repo']) expect(classifyAction(a)).toBe('reversible')
+    expect(ATTACHED_SUDO_ACTIONS).toContain('action:sudo_archive_row')
+    expect(ATTACHED_SUDO_ACTIONS).not.toContain('action:sudo_project_repo') // add_repo widens GitHub write reach
+    expect(ATTACHED_SUDO_ACTIONS).not.toContain('action:sudo_move_agent_squad')
+    expect(classifyAction('action:sudo_move_agent_squad')).toBe('high_risk') // unknown to the bot: fails closed
     expect(ATTACHED_SUDO_ACTIONS).not.toContain('action:mint_token')
     expect(classifyAction('action:mint_token')).toBe('high_risk')
   })
@@ -128,9 +130,11 @@ describe('archive_row: one tap archives one task, work squad or inactive agent',
     expect(archived('tasks', 'task-1')).toBe(0)
   })
   it('after one tap: archives the task AS the owner, exactly once; the card names the exact call', async () => {
+    run(`UPDATE tasks SET gate_owner = 'gate:agent-y', assignee_agent_id = 'agent-y' WHERE id = 'task-1'`)
     const reqId = await approve('action:sudo_archive_row', { type: 'squad', id: 'squad-a' }, { table: 'tasks', id: 'task-1' })
     expect(cardText()).toContain('EXACT CALL')
-    expect(cardText()).toContain('archive task task-1')
+    // the card names the task by title, status, gate owner and assignee, so the human sees WHAT they archive
+    expect(cardText()).toContain('archive task task-1 ("stale one"), status open, gate owner gate:agent-y, assignee agent agent-y ("agent-y") (undo with unarchive_row)')
     const r = await archive()
     expect(r.ok, JSON.stringify(r)).toBe(true)
     expect(r.result).toMatchObject({ status: 'archived', owner_sudo: { executed_as_authority: 'mem-owner', approval: 'spent' } })
@@ -138,6 +142,27 @@ describe('archive_row: one tap archives one task, work squad or inactive agent',
     expect(usage(reqId)).toEqual(['applied'])
     expect((await archive({ id: 'task-2' })).ok).toBe(false) // spent: a second call loses
     expect(archived('tasks', 'task-2')).toBe(0)
+  })
+  it('the card says so when a task has no gate owner and no assignee', async () => {
+    await approve('action:sudo_archive_row', { type: 'squad', id: 'squad-a' }, { table: 'tasks', id: 'task-2' })
+    expect(cardText()).toContain('archive task task-2 ("stale two"), status open, gate owner none, assignee unassigned')
+  })
+  it('the card names a human assignee', async () => {
+    run(`INSERT INTO tasks (id, squad_id, title, status, done_when, assignee_member_id) VALUES ('task-h', 'squad-a', 'human held', 'review', 'never', 'mem-human')`)
+    await approve('action:sudo_archive_row', { type: 'squad', id: 'squad-a' }, { table: 'tasks', id: 'task-h' })
+    expect(cardText()).toContain('status review, gate owner none, assignee member mem-human ("A Human")')
+  })
+  it('ARGS: the digest binds the TABLE: an approval for task dup-1 never archives squad dup-1 (same id, same scope)', async () => {
+    run(`
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('dup-1', 'dept', 'dup-sqd', 'Dup');
+      INSERT INTO tasks (id, squad_id, title, status, done_when) VALUES ('dup-1', 'dup-1', 'dup task', 'open', 'never');
+    `)
+    await approve('action:sudo_archive_row', { type: 'squad', id: 'dup-1' }, { table: 'tasks', id: 'dup-1' })
+    expect(await archive({ table: 'squads', id: 'dup-1' })).toMatchObject({ ok: false, error: 'sudo_args_mismatch' })
+    expect(archived('squads', 'dup-1')).toBe(0)
+    expect(count('elevation_usage_log')).toBe(0)
+    const r = await archive({ table: 'tasks', id: 'dup-1' })
+    expect(r.ok, JSON.stringify(r)).toBe(true)
   })
   it('ARGS: an approval for task-1 does not archive task-2 and spends nothing', async () => {
     await approve('action:sudo_archive_row', { type: 'squad', id: 'squad-a' }, { table: 'tasks', id: 'task-1' })
@@ -174,54 +199,6 @@ describe('archive_row: one tap archives one task, work squad or inactive agent',
     const r = await archive({ table: 'squads', id: 'squad-c' })
     expect(r.ok, JSON.stringify(r)).toBe(true)
     expect(archived('squads', 'squad-c')).toBe(1)
-  })
-})
-
-describe('move_agent_squad: one tap, only into a squad the agent already belongs to', () => {
-  const move = (over: Record<string, unknown> = {}) => out('move_agent_squad', { agent: 'agent-y', to_squad: 'squad-b', capability: 'member', ...over })
-  const homeOf = (id: string): string => one<{ squad_id: string }>('SELECT squad_id FROM agents WHERE id = ?', id).squad_id
-
-  it('refused without an approval', async () => {
-    expect((await move()).ok).toBe(false)
-    expect(homeOf('agent-y')).toBe('squad-a')
-  })
-  it('after one tap: moves the agent AS the owner, once', async () => {
-    const reqId = await approve('action:sudo_move_agent_squad', { type: 'squad', id: 'squad-b' }, { agent: 'agent-y', to_squad: 'squad-b', capability: 'member' })
-    expect(cardText()).toContain('move agent agent-y ("agent-y") to squad squad-b ("b-sqd") (already a member there) as member')
-    const r = await move()
-    expect(r.ok, JSON.stringify(r)).toBe(true)
-    expect(r.result).toMatchObject({ owner_sudo: { executed_as_authority: 'mem-owner', approval: 'spent' } })
-    expect(homeOf('agent-y')).toBe('squad-b')
-    expect(usage(reqId)).toEqual(['applied'])
-  })
-  it('FENCE: a squad the agent is NOT a member of is refused at request time and never moves', async () => {
-    const r = await ask('action:sudo_move_agent_squad', { type: 'squad', id: 'squad-c' }, { agent: 'agent-y', to_squad: 'squad-c', capability: 'member' })
-    expect(r.ok).toBe(false)
-    expect(JSON.stringify(r)).toContain('sudo_move_not_member')
-    expect(count('elevation_requests')).toBe(0)
-    expect(homeOf('agent-y')).toBe('squad-a')
-  })
-  it('FENCE: never above the standing already held there, never lead/admin, never the requesting agent', async () => {
-    run("UPDATE memberships SET capability = 'observer' WHERE id = 'ms-yb'")
-    expect(JSON.stringify(await ask('action:sudo_move_agent_squad', { type: 'squad', id: 'squad-b' }, { agent: 'agent-y', to_squad: 'squad-b', capability: 'member' }))).toContain('sudo_capability_ceiling')
-    expect(JSON.stringify(await ask('action:sudo_move_agent_squad', { type: 'squad', id: 'squad-b' }, { agent: 'agent-y', to_squad: 'squad-b', capability: 'lead' }))).toContain('sudo_capability_ceiling')
-    run("INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES ('ms-xb', 'agent-x', 'squad-b', 'member')")
-    expect(JSON.stringify(await ask('action:sudo_move_agent_squad', { type: 'squad', id: 'squad-b' }, { agent: 'agent-x', to_squad: 'squad-b', capability: 'member' }))).toContain('cannot_grant_to_self')
-    expect(count('elevation_requests')).toBe(0)
-  })
-  it('FENCE: lead/admin are never set, even where the agent already holds lead', async () => {
-    run("UPDATE memberships SET capability = 'lead' WHERE id = 'ms-yb'")
-    for (const capability of ['lead', 'admin']) {
-      expect(JSON.stringify(await ask('action:sudo_move_agent_squad', { type: 'squad', id: 'squad-b' }, { agent: 'agent-y', to_squad: 'squad-b', capability }))).toContain('sudo_capability_ceiling')
-    }
-    expect(count('elevation_requests')).toBe(0)
-  })
-  it('FENCE at use time: membership removed after approval refuses the call and spends nothing', async () => {
-    await approve('action:sudo_move_agent_squad', { type: 'squad', id: 'squad-b' }, { agent: 'agent-y', to_squad: 'squad-b', capability: 'member' })
-    run("DELETE FROM memberships WHERE id = 'ms-yb'")
-    expect(await move()).toMatchObject({ ok: false, error: 'sudo_move_not_member' })
-    expect(homeOf('agent-y')).toBe('squad-a')
-    expect(count('elevation_usage_log')).toBe(0)
   })
 })
 

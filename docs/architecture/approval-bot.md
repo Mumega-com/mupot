@@ -34,7 +34,7 @@ channel; the bot is never offered for a request that names one of them and refus
 
 ## Sudo: one owner action, as you
 
-Seven owner-only acts refuse every agent. With a live approval that names exactly the tool, an agent makes ONE call of it,
+Six owner-only acts refuse every agent. With a live approval that names exactly the tool, an agent makes ONE call of it,
 run as the approving human (the tool sees the human's live standing; the agent is recorded as executor):
 
 | action | tool | covers |
@@ -43,16 +43,16 @@ run as the approving human (the tool sees the human's live standing; the agent i
 | `action:sudo_squad_dyad_pin` | `update_squad` | a call with only `squad`, `dyad_agent_a`, `dyad_agent_b` (and `reason`): pin or clear the review pair |
 | `action:sudo_grant_gate_capability` | `grant_gate_capability` | one `gate:<owner>` grant, org scope; never to the requesting agent or its member |
 | `action:sudo_seat_event_grant` | `seat_event_grant` (new MCP twin of `POST /api/fleet/events/grants`) | let one host receive one agent's seat events |
-| `action:sudo_archive_row` | `archive_row` | archive one task, one work squad or one INACTIVE agent; never a member, a project, a home squad or the requesting agent (W1-2) |
-| `action:sudo_move_agent_squad` | `move_agent_squad` | move one other agent into a work squad it is ALREADY a member of, at observer/member and never above the standing it holds there (W1-2) |
+| `action:sudo_archive_row` | `archive_row` | archive one task, one work squad or one INACTIVE agent; never a member, a project, a home squad or the requesting agent; from an attached chat only a row in its own agent's squads. The card shows a task's title, status, gate owner and assignee (W1-2) |
 | `action:sudo_project_repo` | `project_update` | a call with only `project_id` and exactly one of `add_repo` / `remove_repo`; org scope; the repo is folded with `repoKeyFromUrl` before hashing (W1-2) |
 
 Credentials (mint, list, reveal, revoke a token; register a key) are never on this list, with or without approval (council-20261121-authz).
+`move_agent_squad` is not on it either: a move hands the agent to the destination squad's leads and drops its standing in the source squad, which the agent cannot undo, so it needs its own design.
 
 Rules: behind `OWNER_SUDO_ENABLED` (default off: the actions cannot be requested and `resolveOwnerSudo` is a no-op). Requested alone, org or
 squad scope (a squad scope must be the squad the call touches), 60 minutes at most. **Arguments are bound**: `request_elevation`
 carries `sudo_args` (mandatory for every sudo action: `{capability, principal_type, principal_id}` / `{squad, agent, capability}` /
-`{squad, agent_a, agent_b}` / `{host_agent_id, agent_id, project_id?}` / `{table, id}` / `{agent, to_squad, capability}` /
+`{squad, agent_a, agent_b}` / `{host_agent_id, agent_id, project_id?}` / `{table, id}` /
 `{project_id, op, repo}`); they are resolved to ids, fenced, canonicalised and stored with a
 sha256 (`elevation_requests.sudo_args_json/_sha256`, migration 0249); the Telegram message shows them resolved to names; at use time
 the call's arguments must canonicalise to the same digest or the call is refused and spends nothing. Fences hold at request AND use time:
