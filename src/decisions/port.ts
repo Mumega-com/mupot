@@ -60,6 +60,17 @@ export type DecisionFailureReason =
   | 'malformed_output'
   | 'receipt_write_failed'
 
+/** Which tier answered and how: data for a human reading the proposal, never a permission. */
+export interface DecisionProvenance {
+  readonly tier: string
+  /** direct = first choice answered; escalated = low confidence moved up a tier;
+   *  fallback = first tier failed or was invalid; degraded = a low-confidence answer kept
+   *  because the next tier failed. */
+  readonly path: 'direct' | 'escalated' | 'fallback' | 'degraded'
+  /** Provider-reported confidence (0..1) of the answer returned, when the provider gave one. */
+  readonly providerConfidence?: number
+}
+
 export type DecisionResult =
   | {
       readonly ok: true
@@ -69,6 +80,7 @@ export type DecisionResult =
       readonly modelVersion: string
       readonly latencyMs: number
       readonly inputTokens?: number
+      readonly provenance?: DecisionProvenance
     }
   | { readonly ok: false; readonly reason: DecisionFailureReason }
 
@@ -106,6 +118,7 @@ export type DecideResult =
       readonly latencyMs: number
       readonly receiptId: string
       readonly reason?: string
+      readonly provenance?: DecisionProvenance
     }
   | {
       readonly outcome: 'failed' | 'deferred_to_human'

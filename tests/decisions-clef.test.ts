@@ -106,6 +106,62 @@ describe('clef adapter', () => {
   })
 })
 
+describe('clef adapter: validity, aliases, provenance (round 2)', () => {
+  const nanFlash = { ...FLASH_BODY, answers: { stale: { ...FLASH_BODY.answers.stale, confidence: 0.9, probabilities: { stale: 'x', active: 0.1 } } } }
+  const badChoice = { ...HIGH_FLASH, answers: { stale: { ...HIGH_FLASH.answers.stale, choice: 'bogus' } } }
+  const badSum = { ...HIGH_FLASH, answers: { stale: { ...HIGH_FLASH.answers.stale, probabilities: { stale: 0.3, active: 0.1 } } } }
+
+  for (const [label, bad] of [['non-numeric probability', nanFlash], ['choice outside options', badChoice], ['probabilities do not sum to 1', badSum]] as const) {
+    it(`invalid flash (${label}) at confidence 0.9 escalates to clef as fallback`, async () => {
+      const { env, calls } = envWith((m) => (m === CLEF_FLASH_MODEL ? bad : CLEF_BODY))
+      const r = await createClefAdapter(env).decide(REQUEST, sig())
+      expect(calls.map((c) => c.model)).toEqual([CLEF_FLASH_MODEL, CLEF_MODEL])
+      expect(r).toMatchObject({ ok: true, model: CLEF_MODEL, provenance: { tier: CLEF_MODEL, path: 'fallback', providerConfidence: 0.929 } })
+    })
+  }
+
+  it('out-of-range or non-finite confidence fails closed and escalates', async () => {
+    for (const c of [1.5, -0.1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const body = { ...HIGH_FLASH, answers: { stale: { ...HIGH_FLASH.answers.stale, confidence: c } } }
+      const { env, calls } = envWith((m) => (m === CLEF_FLASH_MODEL ? body : CLEF_BODY))
+      await createClefAdapter(env).decide(REQUEST, sig())
+      expect(calls).toHaveLength(2)
+    }
+  })
+
+  it('bare selectors and @cf ids are aliases', () => {
+    const a = createClefAdapter({} as unknown as Env).aliases ?? []
+    for (const id of ['clef-flash', 'clef', CLEF_FLASH_MODEL, CLEF_MODEL]) expect(a).toContain(id)
+  })
+
+  it('aborted + malformed flash reports malformed_output, not timeout', async () => {
+    const ac = new AbortController()
+    const { env, calls } = envWith(() => { ac.abort(); return { nope: true } })
+    expect(await createClefAdapter(env).decide(REQUEST, ac.signal)).toEqual({ ok: false, reason: 'malformed_output' })
+    expect(calls).toHaveLength(1)
+  })
+
+  it('aborted + parsed-but-invalid flash reports malformed_output, not timeout', async () => {
+    const ac = new AbortController()
+    const { env, calls } = envWith(() => { ac.abort(); return nanFlash })
+    expect(await createClefAdapter(env).decide(REQUEST, ac.signal)).toEqual({ ok: false, reason: 'malformed_output' })
+    expect(calls).toHaveLength(1)
+  })
+
+  it('aborted + flash throws reports adapter_error', async () => {
+    const ac = new AbortController()
+    const { env } = envWith(() => { ac.abort(); return new Error('x') })
+    expect(await createClefAdapter(env).decide(REQUEST, ac.signal)).toEqual({ ok: false, reason: 'adapter_error' })
+  })
+
+  it('direct and degraded provenance', async () => {
+    const a = envWith(() => HIGH_FLASH)
+    expect(await createClefAdapter(a.env).decide(REQUEST, sig())).toMatchObject({ provenance: { tier: CLEF_FLASH_MODEL, path: 'direct', providerConfidence: 0.9 } })
+    const b = envWith((m) => (m === CLEF_FLASH_MODEL ? FLASH_BODY : new Error('x')))
+    expect(await createClefAdapter(b.env).decide(REQUEST, sig())).toMatchObject({ provenance: { tier: CLEF_FLASH_MODEL, path: 'degraded', providerConfidence: 0.7039 } })
+  })
+})
+
 describe('registry', () => {
   it('selects clef', () => expect(selectAdapter({ DECISION_ADAPTER: 'clef' } as unknown as Env).id).toBe('clef'))
   it('default is human', () => {

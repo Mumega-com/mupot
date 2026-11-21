@@ -6,7 +6,8 @@
 // No gateway or credits are needed; DECISION_GATEWAY_ID is honoured as in workers-ai.ts.
 // Output is data to rank/propose from; decide() still owns validation, thresholds and receipts.
 import type { Env } from '../../types'
-import type { DecisionAdapter, DecisionRequest, DecisionResult } from '../port'
+import { answersMatchSchema, DEFAULT_SUM_TOLERANCE } from '../decide'
+import type { DecisionAdapter, DecisionProvenance, DecisionRequest, DecisionResult } from '../port'
 import { minAnswerConfidence, parseSystemOneResponse } from './systemone-shape'
 
 export const CLEF_FLASH_MODEL = '@cf/cloudflare/clef-flash'
@@ -29,7 +30,10 @@ export function createClefAdapter(env: Env): DecisionAdapter {
   return {
     id: 'clef',
     dataPolicy: { maxDataClass: 'metadata', residency: 'cloudflare-workers-ai', retention: 'per-provider-terms-unverified' },
-    aliases: [CLEF_FLASH_MODEL, CLEF_MODEL],
+    // Both the @cf ids and the bare selectors the provider echoes are aliases, never versions.
+    // A body that only echoes the selector has no real version; the port then rejects it
+    // (malformed_output). We do not fabricate one.
+    aliases: [CLEF_FLASH_MODEL, CLEF_MODEL, FLASH.selector, FULL.selector],
     async decide(request: DecisionRequest, signal: AbortSignal): Promise<DecisionResult> {
       // env.AI is typed as the catalogue-typed `Ai`, which does not list the Clef ids;
       // narrow to a minimal structural runner for these calls.
@@ -53,14 +57,37 @@ export function createClefAdapter(env: Env): DecisionAdapter {
       }
 
       const flash = await attempt(FLASH)
-      if (flash.result.ok && flash.confidence >= CLEF_ESCALATION_THRESHOLD) return flash.result
-      if (signal.aborted) return flash.result.ok ? flash.result : { ok: false, reason: 'timeout' }
+      // Escalate unless the flash answer is valid under the SAME schema the port applies
+      // AND confident. An invalid answer must not mask a clef answer the port would accept.
+      const flashValid = flash.result.ok && answersMatchSchema(request, flash.result.answers, DEFAULT_SUM_TOLERANCE)
+      if (flash.result.ok && flashValid && flash.confidence >= CLEF_ESCALATION_THRESHOLD) {
+        return withProvenance(flash.result, { tier: FLASH.id, path: 'direct', providerConfidence: flash.confidence })
+      }
+      if (signal.aborted) {
+        if (flash.result.ok && flashValid) {
+          return withProvenance(flash.result, { tier: FLASH.id, path: 'degraded', providerConfidence: flash.confidence })
+        }
+        return flash.result.ok ? { ok: false, reason: 'malformed_output' } : flash.result
+      }
 
       const full = await attempt(FULL)
-      if (full.result.ok) return full.result
-      // clef failed: a usable (low-confidence) clef-flash answer beats nothing; decide()'s
-      // thresholds still decline it. Otherwise report clef's failure.
-      return flash.result.ok ? flash.result : full.result
+      if (full.result.ok) {
+        return withProvenance(full.result, {
+          tier: FULL.id,
+          path: flash.result.ok && flashValid ? 'escalated' : 'fallback',
+          providerConfidence: full.confidence,
+        })
+      }
+      // clef failed: a valid (low-confidence) clef-flash answer beats nothing; decide()'s
+      // thresholds still decline it. Otherwise report a failure.
+      if (flash.result.ok && flashValid) {
+        return withProvenance(flash.result, { tier: FLASH.id, path: 'degraded', providerConfidence: flash.confidence })
+      }
+      return flash.result.ok ? { ok: false, reason: 'malformed_output' } : full.result
     },
   }
+}
+
+function withProvenance(result: DecisionResult, provenance: DecisionProvenance): DecisionResult {
+  return result.ok ? { ...result, provenance } : result
 }
